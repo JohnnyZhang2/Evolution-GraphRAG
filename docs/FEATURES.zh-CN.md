@@ -188,7 +188,7 @@ Fallback STEP_NEXT：使用 `REL_FALLBACK_CONFIDENCE * REL_WEIGHT_STEP_NEXT`。
 
 ## 环境变量说明
 
-（节选，详见 `.env`）：
+（节选，详见 `.env.example`）：
 
 ```env
 TOP_K=8                    # 初始向量检索数量
