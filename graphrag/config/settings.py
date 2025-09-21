@@ -1,0 +1,89 @@
+# Evolution RAG Configuration Settings
+# Copyright (c) 2025 EvolutionAI Studio
+# All Rights Holder: Johnny Zhang
+# License: MIT (see LICENSE)
+# This file is part of Evolution RAG. Redistribution must retain this notice.
+
+from pydantic import Field
+from pydantic_settings import BaseSettings
+from functools import lru_cache
+
+class Settings(BaseSettings):
+    neo4j_uri: str = Field(..., env="NEO4J_URI")
+    neo4j_user: str = Field(..., env="NEO4J_USER")
+    neo4j_password: str = Field(..., env="NEO4J_PASSWORD")
+
+    # ---- API Version ----
+    # Bump this when breaking API response contracts or adding notable features
+    api_version: str = Field("0.1.0", env="API_VERSION")
+
+    llm_base_url: str = Field("http://192.168.31.172:1234", env="LLM_BASE_URL")
+    llm_api_key: str = Field("dummy", env="LLM_API_KEY")  # LM Studio 通常不校验，可以给默认
+    llm_model: str = Field("openai/gpt-oss-120b", env="LLM_MODEL")
+    # 默认 embedding 模型修改为最新提供的名称
+    embedding_model: str = Field("text-embedding-qwen3-embedding-0.6b", env="EMBEDDING_MODEL")
+
+    top_k: int = Field(8, env="TOP_K")
+    expand_hops: int = Field(1, env="EXPAND_HOPS")
+    chunk_size: int = Field(800, env="CHUNK_SIZE")
+    chunk_overlap: int = Field(120, env="CHUNK_OVERLAP")
+    disable_entity_extract: bool = Field(False, env="DISABLE_ENTITY_EXTRACT")
+    relation_extraction: bool = Field(True, env="RELATION_EXTRACTION")
+    relation_window: int = Field(2, env="RELATION_WINDOW")  # 相邻窗口大小 (前后各 N 个 chunk 组合)
+    relation_chunk_trunc: int = Field(400, env="RELATION_CHUNK_TRUNC")  # 单 chunk 传给 LLM 的最大字符
+    relation_llm_temperature: float = Field(0.0, env="RELATION_LLM_TEMPERATURE")
+    relation_debug: bool = Field(False, env="RELATION_DEBUG")
+    # 关系类型权重（可通过环境变量覆盖，如 REL_WEIGHT_STEP_NEXT=0.12）
+    rel_weight_step_next: float = Field(0.12, env="REL_WEIGHT_STEP_NEXT")
+    rel_weight_references: float = Field(0.18, env="REL_WEIGHT_REFERENCES")
+    rel_weight_follows: float = Field(0.16, env="REL_WEIGHT_FOLLOWS")
+    rel_weight_causes: float = Field(0.22, env="REL_WEIGHT_CAUSES")
+    rel_weight_supports: float = Field(0.2, env="REL_WEIGHT_SUPPORTS")
+    rel_weight_part_of: float = Field(0.15, env="REL_WEIGHT_PART_OF")
+    rel_weight_substep_of: float = Field(0.17, env="REL_WEIGHT_SUBSTEP_OF")
+    rel_weight_contrasts: float = Field(0.14, env="REL_WEIGHT_CONTRASTS")
+    # 默认 llm_rel 基础权重放大系数（缺失 type 时使用）
+    rel_weight_default: float = Field(0.15, env="REL_WEIGHT_DEFAULT")
+    # 非 LLM 关系加成
+    rel_weight_relates: float = Field(0.15, env="REL_WEIGHT_RELATES")
+    rel_weight_cooccur: float = Field(0.10, env="REL_WEIGHT_COOCCUR")
+    # 缓存与索引
+    embed_cache_max: int = Field(128, env="EMBED_CACHE_MAX")
+    answer_cache_max: int = Field(64, env="ANSWER_CACHE_MAX")
+    vector_index_name: str = Field("chunk_embedding_index", env="VECTOR_INDEX_NAME")
+    # fallback STEP_NEXT 关系置信度
+    rel_fallback_confidence: float = Field(0.3, env="REL_FALLBACK_CONFIDENCE")
+
+    # ---- Rerank (post-score) ----
+    rerank_enabled: bool = Field(False, env="RERANK_ENABLED")
+    rerank_alpha: float = Field(0.5, env="RERANK_ALPHA")  # final = alpha * composite + (1-alpha) * rerank
+
+    # ---- BM25 / Hybrid ----
+    bm25_enabled: bool = Field(False, env="BM25_ENABLED")
+    bm25_weight: float = Field(0.4, env="BM25_WEIGHT")  # 归一后占比（与向量得分类似范围）
+    bm25_min_df: int = Field(1, env="BM25_MIN_DF")
+
+    # ---- 内容哈希增量 ----
+    hash_incremental_enabled: bool = Field(False, env="HASH_INCREMENTAL_ENABLED")
+    hash_algo: str = Field("sha256", env="HASH_ALGO")
+
+    # ---- 实体标准化 / 同义合并 ----
+    entity_normalize_enabled: bool = Field(False, env="ENTITY_NORMALIZE_ENABLED")
+    synonyms_file: str | None = Field(None, env="SYNONYMS_FILE")  # 可选：JSON 或 TSV (alt\tcanonical)
+
+    # ---- 图中心性加成 (Degree) ----
+    graph_rank_enabled: bool = Field(False, env="GRAPH_RANK_ENABLED")
+    graph_rank_weight: float = Field(0.1, env="GRAPH_RANK_WEIGHT")
+
+    # ---- 噪声控制（实体与共现） ----
+    entity_min_length: int = Field(2, env="ENTITY_MIN_LENGTH")  # 小于该长度的实体丢弃
+    cooccur_min_count: int = Field(2, env="COOCCUR_MIN_COUNT")  # 共现边低于该计数则清理（prune）
+
+    class Config:
+        case_sensitive = False
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+@lru_cache()
+def get_settings() -> Settings:
+    return Settings()

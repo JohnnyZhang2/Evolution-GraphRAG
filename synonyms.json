@@ -1,0 +1,16 @@
+{
+  "AI": ["人工智能", "A.I.", "Artificial Intelligence"],
+  "Neo4j": ["neo4J", "Neo4J", "neo-4j"],
+  "OpenAI": ["open ai", "Open Ai"],
+  "Large Language Model": ["LLM", "大语言模型", "大型语言模型"],
+  "GraphRAG": ["graph rag", "Graph-RAG"],
+  "International Business Machines": ["IBM", "I.B.M"],
+  "USA": ["United States", "U.S.A", "US", "U.S."],
+  "Python": ["python3", "Py"],
+  "PostgreSQL": ["Postgres", "postgreSQL", "PG"],
+  "SQL": ["Structured Query Language"],
+  "GPU": ["Graphics Processing Unit", "G.P.U"],
+  "API": ["Application Programming Interface", "A.P.I"],
+  "LM Studio": ["lmstudio", "LM-Studio"],
+  "Open Source": ["Open-Source", "开源"]
+}

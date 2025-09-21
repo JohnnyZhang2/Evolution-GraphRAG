@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+neo4j
+pydantic
+pydantic-settings
+python-dotenv
+requests
+tenacity
+numpy
+scikit-learn
+python-docx
+openpyxl
+PyPDF2
+tiktoken
+orjson
+pytest

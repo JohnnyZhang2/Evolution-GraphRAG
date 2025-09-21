@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual env
+.venv/
+venv/
+ENV/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs & reports
+*.log
+coverage.xml
+htmlcov/
+.coverage*
+.pytest_cache/
+.mypy_cache/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Cache
+.cache/
+
+# Generated artifacts (if any future)
+node_modules/
+
+# Local data paths (add if you store raw docs outside repo)
+# data/
