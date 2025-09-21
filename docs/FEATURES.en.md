@@ -8,6 +8,7 @@
 - [Data Model](#data-model)
 - [Ingest Pipeline](#ingest-pipeline)
 - [Ingest Modes](#ingest-modes)
+- [Real-time Ingest & Recovery](#real-time-ingest--recovery)
 - [Query Flow](#query-flow)
 - [Scoring & Weights](#scoring--weights)
 - [Caching](#caching)
@@ -131,6 +132,95 @@ Incremental ingest: unchanged chunks (same hash) skip embedding, entity extracti
 
 If both `incremental` and `refresh` supplied, refresh takes precedence.
 
+## Real-time Ingest & Recovery
+
+### 1. Server-Sent Events (SSE) Progress
+
+For long documents or enabled relation extraction, `/ingest` may block for a while. Use:
+
+```text
+GET /ingest/stream?path=/abs/file/or/dir&incremental=false&refresh=false&refresh_relations=true&checkpoint=true
+```
+
+It streams `text/event-stream` events, each separated by a blank line:
+
+```text
+event: start
+data: {}
+
+data: {"stage":"scan_input","detail":"path=/data/book.txt"}
+data: {"stage":"embedding_batch","detail":"batch_ok","current":3,"total":12}
+data: {"stage":"embedding_progress","current":240,"total":1300}
+data: {"stage":"relation_extraction","current":120,"total":860}
+event: result
+data: {"stage":"result","result":{"chunks_total":1300,"chunks_embedded":820,...}}
+data: {"stage":"done"}
+```
+
+Common stages: `scan_input`, `hash_computed`, `existing_scan`, `embedding`, `embedding_batch`, `embedding_progress`, `schema_index`, `entity_extraction`, `relates_to`, `relation_start`, `relation_extraction`, `relation_extraction_done`, plus synthetic `result` and terminal `done`. On error:
+
+```json
+{"stage":"error","error":"<message>"}
+```
+
+Client guidance: consume line by line (EventSource or fetch stream), update progress bars using `(current,total)` in embedding / relation stages, cache final summary from `result`, terminate on `done`. Heartbeat events can be added later (not yet built-in).
+
+### 2. Checkpoint (Resume)
+
+With `checkpoint=true` (default) a JSON file `.ingest_ck_<basename>.json` is written alongside the source:
+
+```json
+{
+  "chunks": {"file::chunk_0": {"emb": true, "ent": true}},
+  "rel_pairs": {"file::chunk_0|file::chunk_1": {"rels": 1}}
+}
+```
+
+Meaning:
+
+- `chunks[chunk_id].emb`: embedding done
+- `chunks[chunk_id].ent`: entity extraction done
+- `rel_pairs[a|b].rels`: relation pair processed (may hold >1 relations)
+- Optional `err` marks last failure (retry on refresh)
+
+Re-running ingest (without `refresh=true`) skips completed steps. Delete the checkpoint file or set `refresh=true` to force rebuild.
+
+### 3. Embedding Batching & Adaptive Retry
+
+`embed_texts` workflow:
+
+1. Start with `EMBEDDING_BATCH_SIZE`.
+2. On timeout / 5xx / 429: halve the batch (binary split) and retry.
+3. Single-item batches still failing: exponential backoff until `EMBEDDING_MAX_RETRIES` exceeded.
+4. Preserve input order; collect per-batch success metrics and emit `embedding_batch` + aggregate `embedding_progress` events (and optional callback).
+
+### 4. Optional EOS Token Append
+
+Some embedding backends prefer an explicit end token; enable:
+
+- `EMBEDDING_APPEND_EOS=true` to append a token to every chunk.
+- `EMBEDDING_EOS_TOKEN=</eos>` (adjust to model vocabulary).
+
+### 5. Progress Callback & Observability
+
+The ingest pipeline records internal stages via `record()`. They are:
+
+- Collected into the synchronous `/ingest?progress=true` response array.
+- Forwarded immediately via a provided `progress_callback` (SSE supplies one) to stream events.
+
+### 6. New Environment Variables (Summary)
+
+| Variable | Purpose | Example Default | Notes |
+|----------|---------|-----------------|-------|
+| EMBEDDING_BATCH_SIZE | Initial embedding batch size | 32 | Auto-splits on failures |
+| EMBEDDING_TIMEOUT | Per-batch request timeout (sec) | 30 | Triggers retry/split |
+| EMBEDDING_MAX_RETRIES | Max retries for a unit (batch/item) | 4 | Backoff on 429/5xx/timeout |
+| EMBEDDING_APPEND_EOS | Append EOS token if true | false | Helps tokenizer stability |
+| EMBEDDING_EOS_TOKEN | EOS token string | </eos> | Must exist in vocab |
+| checkpoint (query param) | enable checkpoint file | true | Passed via URL param |
+
+See `.env.example` for the authoritative list.
+
 ## Query Flow
 
 1. Normalize query (synonyms if entity normalization active).
@@ -198,23 +288,58 @@ Endpoints: `/cache/stats`, `/cache/clear`.
 
 ## Environment Variables
 
-Excerpt (see `.env.example` for full list):
+Excerpt (see `.env.example` for full list). Defaults shown below are the code defaults from `graphrag/config/settings.py` (Pydantic `Field(default, env=...)`). If an env var is absent at runtime these defaults apply.
 
-```env
-TOP_K=8                     # Initial vector retrieval size
-EXPAND_HOPS=1               # 2 enables entity/relation expansion
-CHUNK_SIZE=800              # Split length
-RELATION_WINDOW=2           # Pairwise semantic relation window
-RELATION_CHUNK_TRUNC=400    # Relation extraction truncation (default 400)
-REL_FALLBACK_CONFIDENCE=0.3
-REL_WEIGHT_CAUSES=0.22      # Relation weight example
-BM25_ENABLED=false
-GRAPH_RANK_ENABLED=false
-HASH_INCREMENTAL_ENABLED=true
-ENTITY_NORMALIZE_ENABLED=true
-ENTITY_MIN_LENGTH=2
-COOCCUR_MIN_COUNT=2
-```
+| Env Var | Default (settings.py) | Purpose (abridged) |
+|---------|-----------------------|--------------------|
+| TOP_K | 8 | Initial vector retrieval size |
+| EXPAND_HOPS | 1 | Graph expansion hops (set 2 to expand) |
+| CHUNK_SIZE | 800 | Split length (characters) |
+| CHUNK_OVERLAP | 120 | Overlap when splitting |
+| RELATION_WINDOW | 2 | Pairwise relation window width |
+| RELATION_CHUNK_TRUNC | 400 | Max chars per chunk for relation LLM |
+| REL_FALLBACK_CONFIDENCE | 0.3 | Confidence used for STEP_NEXT fallback |
+| REL_WEIGHT_CAUSES | 0.22 | Relation type weight example |
+| REL_WEIGHT_STEP_NEXT | 0.12 | Fallback / step-next weight |
+| REL_WEIGHT_SUPPORTS | 0.2 | Supports relation weight |
+| REL_WEIGHT_REFERENCES | 0.18 | References relation weight |
+| REL_WEIGHT_FOLLOWS | 0.16 | Follows relation weight |
+| REL_WEIGHT_PART_OF | 0.15 | Part-of relation weight |
+| REL_WEIGHT_SUBSTEP_OF | 0.17 | Substep-of relation weight |
+| REL_WEIGHT_CONTRASTS | 0.14 | Contrasts relation weight |
+| REL_WEIGHT_DEFAULT | 0.15 | Default semantic relation weight |
+| REL_WEIGHT_RELATES | 0.15 | Shared-entity edge bonus |
+| REL_WEIGHT_COOCCUR | 0.10 | Co-occurrence edge bonus |
+| BM25_ENABLED | false | Enable sparse BM25 fusion |
+| GRAPH_RANK_ENABLED | false | Enable degree-based bonus |
+| HASH_INCREMENTAL_ENABLED | false | Skip unchanged hashes |
+| ENTITY_NORMALIZE_ENABLED | false | Enable entity synonym normalization |
+| ENTITY_MIN_LENGTH | 2 | Min entity length filter |
+| COOCCUR_MIN_COUNT | 2 | Min co-occurrence edge count |
+| EMBEDDING_MODEL | text-embedding-qwen3-embedding-0.6b | Embedding model name |
+| EMBEDDING_BATCH_SIZE | 64 | Initial embedding batch size |
+| EMBEDDING_TIMEOUT | 120 | Per-batch HTTP timeout (seconds) |
+| EMBEDDING_MAX_RETRIES | 6 | Max retries after batch splits |
+| EMBEDDING_APPEND_EOS | false | Append EOS token if true |
+| EMBEDDING_EOS_TOKEN | "" | EOS token (blank -> fallback to newline) |
+| GRAPH_RANK_WEIGHT | 0.1 | Degree score weight |
+| BM25_WEIGHT | 0.4 | BM25 normalized score weight |
+| RERANK_ENABLED | false | Enable rerank placeholder stage |
+| RERANK_ALPHA | 0.5 | Blend factor if rerank enabled |
+| EMBED_CACHE_MAX | 128 | Embedding cache capacity |
+| ANSWER_CACHE_MAX | 64 | Answer cache capacity |
+| VECTOR_INDEX_NAME | chunk_embedding_index | Neo4j vector index name |
+| RELATION_LLM_TEMPERATURE | 0.0 | Temperature for relation extraction LLM |
+| RELATION_EXTRACTION | true | Enable pairwise relation extraction |
+| DISABLE_ENTITY_EXTRACT | false | Disable entity extraction stage |
+
+Footnotes:
+
+1. Some weights (REL_WEIGHT_*) may be tuned; keep them within a small band (0.05–0.3) to avoid dominance.
+2. Setting `EMBEDDING_APPEND_EOS=true` with empty `EMBEDDING_EOS_TOKEN` falls back to a newline character at runtime.
+3. Raising `EMBEDDING_BATCH_SIZE` can improve throughput but increases timeout risk; adaptive splitting will mitigate failures.
+4. `HASH_INCREMENTAL_ENABLED` only influences skip logic when `incremental=true` is passed to ingest.
+5. `RELATION_EXTRACTION=false` disables all :REL creation, reducing ingest latency substantially.
 
 Adjusting these impacts recall, precision, latency, and hallucination risk. See Tuning Guide.
 

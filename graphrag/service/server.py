@@ -1,7 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
 from ..schemas.api import IngestRequest, QueryRequest
 from ..graph_ingest.ingest import ingest_path
+import threading
+import queue
+import json
+import time
 from fastapi import Query
 from ..retriever.retrieve import answer_question, _question_embedding_cache, _answer_cache
 from ..retriever.retrieve import vector_search, expand_context, get_driver
@@ -21,14 +25,97 @@ def health():
     return {"status": "ok", "api_version": settings.api_version}
 
 @app.post("/ingest")
-def ingest(req: IngestRequest, incremental: bool = Query(False, description="仅新增文件/Chunk"), refresh: bool = Query(False, description="刷新已存在 Chunk 的实体与关系"), refresh_relations: bool = Query(True, description="刷新模式下是否重新抽取 LLM 关系")):
+def ingest(
+    req: IngestRequest,
+    incremental: bool = Query(False, description="仅新增文件/Chunk"),
+    refresh: bool = Query(False, description="刷新已存在 Chunk 的实体与关系"),
+    refresh_relations: bool = Query(True, description="刷新模式下是否重新抽取 LLM 关系"),
+    progress: bool = Query(False, description="返回详细进度阶段列表")
+):
     try:
-        result = ingest_path(req.path, incremental=incremental, refresh=refresh, refresh_relations=refresh_relations)
+        result = ingest_path(
+            req.path,
+            incremental=incremental,
+            refresh=refresh,
+            refresh_relations=refresh_relations,
+            collect_progress=progress
+        )
         return result
     except Exception as e:
         import traceback
         tb = traceback.format_exc(limit=3)
         raise HTTPException(status_code=500, detail=f"{e}; trace={tb}")
+
+@app.get("/ingest/stream")
+def ingest_stream(
+    path: str = Query(..., description="文件或目录绝对路径"),
+    incremental: bool = Query(False),
+    refresh: bool = Query(False),
+    refresh_relations: bool = Query(True),
+    checkpoint: bool = Query(True),
+):
+    """通过 SSE 流式推送 ingest 进度事件。
+
+    事件格式：data: {"stage":"...", "detail":"...", "current":1, "total":100}\n\n
+    结束：发送一条 data: {"stage":"done", ...}\n\n
+    错误：发送 data: {"stage":"error", "error":"..."}\n\n 后终止。
+    """
+    q: "queue.Queue[dict]" = queue.Queue()
+    stop_flag = {"stopped": False}
+
+    def progress_cb(ev: dict):
+        try:
+            q.put(ev)
+        except Exception:
+            pass
+
+    def worker():
+        try:
+            result = ingest_path(
+                path,
+                incremental=incremental,
+                refresh=refresh,
+                refresh_relations=refresh_relations,
+                collect_progress=True,
+                checkpoint=checkpoint,
+                progress_callback=progress_cb
+            )
+            q.put({"stage": "result", "result": result})
+            q.put({"stage": "done"})
+        except Exception as e:
+            q.put({"stage": "error", "error": str(e)})
+        finally:
+            stop_flag["stopped"] = True
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    def event_stream():
+        # 发送初始握手事件
+        yield "event: start\ndata: {}\n\n"
+        while not stop_flag["stopped"] or not q.empty():
+            try:
+                ev = q.get(timeout=0.5)
+            except Exception:
+                continue
+            # 区分 result 事件（非进度）
+            if ev.get("stage") == "result":
+                payload = json.dumps(ev, ensure_ascii=False)
+                yield f"event: result\ndata: {payload}\n\n"
+            else:
+                payload = json.dumps(ev, ensure_ascii=False)
+                yield f"data: {payload}\n\n"
+        # 结束（若未显式 done）
+        if not any(ev.get("stage") == "done" for ev in []):
+            yield "data: {\"stage\":\"done\"}\n\n"
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+    }
+    return StreamingResponse(event_stream(), headers=headers, media_type="text/event-stream")
 
 @app.post("/query")
 def query(req: QueryRequest):

@@ -16,6 +16,7 @@
 | GET  | /cache/stats | 缓存统计 | 观察嵌入/答案缓存命中规模 |
 | POST | /cache/clear | 清空缓存 | 排查状态或释放内存 |
 | POST | /ranking/preview | 混合打分预览 | 分析检索阶段各信号贡献 |
+| GET  | /ingest/stream | 导入实时进度(SSE) | 大文件/长流程可视化 & 前端反馈 |
 
 ## 通用说明
 
@@ -77,6 +78,86 @@ Query 参数（全部可选）：
   "detail": "File not found: ./bad_path"  // HTTP 500 或 400（根据实现）
 }
 ```
+
+### 2.1 流式导入进度 (SSE)
+
+当文档较大或启用关系抽取（LLM）时，单次 `/ingest` 可能耗时较长。可使用：
+
+```text
+GET /ingest/stream?path=/绝对路径/文件或目录&incremental=false&refresh=false&refresh_relations=true&checkpoint=true
+```
+
+响应 `Content-Type: text/event-stream`，以 Server-Sent Events 形式连续输出多行事件，每个事件之间有一个空行。示例（节选）：
+
+```text
+event: start
+data: {}
+
+data: {"stage":"scan_input","detail":"path=/data/book.txt"}
+
+data: {"stage":"embedding_batch","detail":"batch_ok","current":3,"total":10}
+
+data: {"stage":"embedding_progress","current":320,"total":1300}
+
+data: {"stage":"relation_extraction","current":150,"total":860}
+
+event: result
+data: {"stage":"result","result":{"chunks_total":1300,"chunks_embedded":820,...}}
+
+data: {"stage":"done"}
+```
+
+常见阶段(stage) 值：`scan_input`, `hash_computed`, `existing_scan`, `embedding`, `embedding_batch`, `embedding_progress`, `schema_index`, `entity_extraction`, `relates_to`, `relation_start`, `relation_extraction`, `relation_extraction_done`, 以及最终的 `result`（含聚合统计）与 `done`。如出错，会输出：
+
+```json
+{"stage":"error","error":"<message>"}
+```
+
+前端可按以下基本逻辑处理：
+
+1. 建立 EventSource（或 fetch+ReadableStream）读取逐行。
+2. 根据 `stage` 更新进度条（embedding 与 relation 阶段会包含 current/total）。
+3. 收到 `event: result` 时缓存最终统计；收到 `done` 结束。
+
+快速测试（`curl -N` 保持连接不断开）：
+
+```bash
+curl -N 'http://localhost:8010/ingest/stream?path=/data/book.txt&checkpoint=true'
+```
+
+#### 2.1.1 断点续传 / Checkpoint
+
+当 `checkpoint=true`（默认）时，系统会在源文件或目录同级写入一个 `.ingest_ck_<basename>.json`：
+
+```json
+{
+  "chunks": { "file::chunk_0": { "emb": true, "ent": true } },
+  "rel_pairs": { "file::chunk_0|file::chunk_1": { "rels": 1 } }
+}
+```
+
+含义：
+
+- `chunks`: 记录每个切分块的嵌入(`emb`)与实体抽取(`ent`)是否已完成。
+- `rel_pairs`: 记录已处理过的关系对（两段文本对），`rels` 计数表示提取成功次数；若存在 `err` 字段表示先前失败（重跑需 refresh）。
+
+再次运行同路径 ingest（且未设置 `refresh=true`）时：
+
+1. 已有且 `emb=true` 的 chunk 跳过重复嵌入。
+2. 已有且 `ent=true` 的 chunk 跳过实体抽取。
+3. 已存在的 `rel_pairs` 键跳过重新关系抽取。
+
+若希望强制重建，可：
+
+- 删除该 checkpoint 文件；或
+- 在请求中添加 `refresh=true`（同时可控制 `refresh_relations`）。
+
+注意：
+
+- 当前未持久化“失败对”的重试次数，只要未标记成功会在刷新时重新尝试。
+- 大语料建议开启 checkpoint 以便中途宕机后快速恢复。
+- SSE 模式与同步 `/ingest` 返回的 `progress=true` 列表阶段含义一致，只是实时推送。
+
 
 ## 3. 提问接口
 
@@ -310,7 +391,7 @@ curl -X POST http://localhost:8000/query \
 后续若接口字段发生破坏性调整，应：
 
 1. 递增 `api_version`：MAJOR(破坏性)/MINOR(兼容新增)/PATCH(微修复)。
-2. 在 `CHANGELOG.md` 中记录变更。 
+2. 在 `CHANGELOG.md` 中记录变更。
 3. 客户端在调用前可先访问 `/diagnostics` 或 `/health` 读取版本，进行兼容逻辑分支。
 
 ---

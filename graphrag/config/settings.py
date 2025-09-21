@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     llm_model: str = Field("openai/gpt-oss-120b", env="LLM_MODEL")
     # 默认 embedding 模型修改为最新提供的名称
     embedding_model: str = Field("text-embedding-qwen3-embedding-0.6b", env="EMBEDDING_MODEL")
+    embedding_batch_size: int = Field(64, env="EMBEDDING_BATCH_SIZE")  # 单次请求的最大文本数
+    embedding_timeout: int = Field(120, env="EMBEDDING_TIMEOUT")  # 单个 HTTP 请求超时秒数
+    embedding_max_retries: int = Field(6, env="EMBEDDING_MAX_RETRIES")  # 单文本降到 size=1 后针对 429/5xx 的最大重试
 
     top_k: int = Field(8, env="TOP_K")
     expand_hops: int = Field(1, env="EXPAND_HOPS")
@@ -78,6 +81,11 @@ class Settings(BaseSettings):
     # ---- 噪声控制（实体与共现） ----
     entity_min_length: int = Field(2, env="ENTITY_MIN_LENGTH")  # 小于该长度的实体丢弃
     cooccur_min_count: int = Field(2, env="COOCCUR_MIN_COUNT")  # 共现边低于该计数则清理（prune）
+
+    # ---- Embedding EOS Handling ----
+    # 某些 ggml/gguf 模型期望输入末尾含 EOS token；否则可能出现警告或向量不稳定。
+    embedding_append_eos: bool = Field(False, env="EMBEDDING_APPEND_EOS")
+    embedding_eos_token: str = Field("", env="EMBEDDING_EOS_TOKEN")  # 若为空且 append_eos=True，使用默认 '\n'
 
     class Config:
         case_sensitive = False

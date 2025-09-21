@@ -11,6 +11,8 @@
 - [Ingest 处理链](#ingest-处理链)
 - [Ingest 模式](#ingest-模式)
 - [检索流程](#检索流程)
+- [实时导入与恢复机制](#实时导入与恢复机制)
+- [检索流程](#检索流程)
 - [排序与权重策略](#排序与权重策略)
 - [缓存机制](#缓存机制)
 - [诊断与工具](#诊断与工具)
@@ -123,6 +125,86 @@ Query: Question -> normalize synonyms -> embed(cache)
 
 > 若同时传 incremental 与 refresh，`refresh` 优先。
 
+## 实时导入与恢复机制
+
+### 1. Server-Sent Events (SSE) 实时进度
+
+长文档或开启关系抽取时，`/ingest` 阻塞时间较长。`/ingest/stream` 端点通过 `text/event-stream` 推送阶段事件：
+
+```text
+event: start
+data: {}
+
+data: {"stage":"scan_input","detail":"path=/data/book.txt"}
+data: {"stage":"embedding_batch","detail":"batch_ok","current":3,"total":12}
+data: {"stage":"embedding_progress","current":240,"total":1300}
+data: {"stage":"relation_extraction","current":120,"total":860}
+event: result
+data: {"stage":"result","result":{"chunks_total":1300,"chunks_embedded":820,...}}
+data: {"stage":"done"}
+```
+
+常见 stage：`scan_input`, `hash_computed`, `existing_scan`, `embedding`, `embedding_batch`, `embedding_progress`, `schema_index`, `entity_extraction`, `relates_to`, `relation_start`, `relation_extraction`, `relation_extraction_done`, `result`, `done`，以及错误时的 `error`。
+
+前端处理建议：使用 EventSource 逐行解析；依据 `stage` 更新进度条；`event: result` 保存最终统计；`done` 关闭流。必要时可扩展心跳事件（尚未内置）。
+
+### 2. 断点续传 (Checkpoint)
+
+默认 `checkpoint=true` 会在源文件（或目录）同级生成 `.ingest_ck_<basename>.json`，记录已完成的嵌入、实体、关系对：
+
+```json
+{
+  "chunks": {"file::chunk_0": {"emb": true, "ent": true}},
+  "rel_pairs": {"file::chunk_0|file::chunk_1": {"rels": 1}}
+}
+```
+
+含义：
+
+- `chunks[chunk_id].emb`：该切分块嵌入已完成
+- `chunks[chunk_id].ent`：该切分块实体抽取完成
+- `rel_pairs[a|b].rels`：该 pair 语义关系已处理（可包含多条）
+- 失败时可能出现 `err` 字段（当前未持久化重试次数）
+
+再次运行同路径 ingest（且非 `refresh=true`）时会跳过已完成部分，仅处理新增或失败项。删除文件或加 `refresh=true` 可强制全量重建。
+
+### 3. 嵌入批处理与自适应重试
+
+`embed_texts` 内部实现：
+
+1. 初始按 `EMBEDDING_BATCH_SIZE` 切批；超时或 5xx/429 触发批量二分减半。
+2. 单元素仍失败按指数退避（指数回退 sleep）重试，最多 `EMBEDDING_MAX_RETRIES` 次。
+3. 成功批写回保持原顺序；失败记录错误并继续后续批。
+4. 通过 `progress_cb` 回调与 SSE `embedding_batch` / `embedding_progress` 事件实时反馈。
+
+### 4. EOS 追加配置
+
+某些本地模型（如部分开源 Embedding）在未显式结束标记时报 tokenizer 警告，可启用：
+
+- `EMBEDDING_APPEND_EOS=true`：对每个 chunk 文本末尾追加自定义 token
+- `EMBEDDING_EOS_TOKEN=</eos>`：默认示例，可按模型词表修改
+
+### 5. 进度回调与可观测性
+
+Ingest 内部对关键阶段调用 `record()`：
+
+- 累计保存在同步 `/ingest?progress=true` 的 `progress` 数组
+- 若传入 `progress_callback`（SSE 模式注入）则同步推送事件
+
+### 6. 新增环境变量摘要（补充）
+
+| 变量 | 作用 | 默认示例 | 行为说明 |
+|------|------|----------|----------|
+| EMBEDDING_BATCH_SIZE | 初始嵌入批大小 | 32 | 超时会自动减半切分 |
+| EMBEDDING_TIMEOUT | 单批请求超时秒 | 30 | 超时触发重试/批量拆分 |
+| EMBEDDING_MAX_RETRIES | 最大重试次数 | 4 | 对 429/5xx 或持续超时生效 |
+| EMBEDDING_APPEND_EOS | 是否追加 EOS token | false | true 时末尾拼接 EOS_TOKEN |
+| EMBEDDING_EOS_TOKEN | 自定义 EOS token | </eos> | 与模型词表保持一致 |
+| CHECKPOINT (ingest 参数) | 是否启用断点文件 | true | 可在 URL 查询参数中覆盖 |
+
+> 这些变量需在 `.env` 中设置并重启服务生效；详见 `docs/.env.example`。
+
+
 ## 检索流程
 
 1. 规范化查询（同义词替换，若开启实体标准化）
@@ -130,7 +212,7 @@ Query: Question -> normalize synonyms -> embed(cache)
 3. 向量初检 TOP_K
 4. 可选扩展 (EXPAND_HOPS=2)：通过实体、`RELATES_TO`、`CO_OCCURS_WITH`、`:REL` 邻接扩展候选集合
 5. 计算 hybrid 基础分：向量归一 + （可选 BM25）+ （可选 GraphRank）
-6. 应用关系加成：共享实体 / 共现 / LLM 语义类型 * confidence * 对应权重
+6. 应用关系加成：共享实体/共现/LLM 语义类型 × confidence × 对应权重
 7. 占位 rerank（若启用，当前不改变顺序，仅计分）
 8. 截断 TopN -> 组装含 [S#] 标签上下文 -> 发送回答
 9. 回答后处理（引用解析 / 未用来源 / 未引用数字）
@@ -188,23 +270,58 @@ Fallback STEP_NEXT：使用 `REL_FALLBACK_CONFIDENCE * REL_WEIGHT_STEP_NEXT`。
 
 ## 环境变量说明
 
-（节选，详见 `.env.example`）：
+节选（详见 `.env.example`）。下表默认值来自 `graphrag/config/settings.py` 中 Pydantic `Field(default, env=...)` 定义；若运行时未显式设置，对应默认生效。
 
-```env
-TOP_K=8                    # 初始向量检索数量
-EXPAND_HOPS=1              # 2 = 启用实体/关系二跳扩展
-CHUNK_SIZE=800             # 切分长度
-RELATION_WINDOW=2          # Pairwise 关系窗口
-RELATION_CHUNK_TRUNC=400   # 关系抽取截断（代码默认 400）
-REL_FALLBACK_CONFIDENCE=0.3
-REL_WEIGHT_CAUSES=0.22     # 关系类型权重 (… 其余略)
-BM25_ENABLED=false
-GRAPH_RANK_ENABLED=false
-HASH_INCREMENTAL_ENABLED=true
-ENTITY_NORMALIZE_ENABLED=true
-ENTITY_MIN_LENGTH=2
-COOCCUR_MIN_COUNT=2
-```
+| 变量 | 默认值(settings.py) | 作用（摘要） |
+|------|---------------------|--------------|
+| TOP_K | 8 | 初始向量检索数量 |
+| EXPAND_HOPS | 1 | 图扩展跳数（设 2 启用关系/实体扩展）|
+| CHUNK_SIZE | 800 | 切分长度（字符）|
+| CHUNK_OVERLAP | 120 | 切分重叠 |
+| RELATION_WINDOW | 2 | Pairwise 关系窗口宽度 |
+| RELATION_CHUNK_TRUNC | 400 | 关系抽取单 chunk 截断字符数 |
+| REL_FALLBACK_CONFIDENCE | 0.3 | STEP_NEXT fallback 置信度 |
+| REL_WEIGHT_STEP_NEXT | 0.12 | Fallback / step-next 权重 |
+| REL_WEIGHT_REFERENCES | 0.18 | References 关系权重 |
+| REL_WEIGHT_FOLLOWS | 0.16 | Follows 关系权重 |
+| REL_WEIGHT_CAUSES | 0.22 | Causes 关系权重 |
+| REL_WEIGHT_SUPPORTS | 0.2 | Supports 关系权重 |
+| REL_WEIGHT_PART_OF | 0.15 | Part_of 权重 |
+| REL_WEIGHT_SUBSTEP_OF | 0.17 | Substep_of 权重 |
+| REL_WEIGHT_CONTRASTS | 0.14 | Contrasts 权重 |
+| REL_WEIGHT_DEFAULT | 0.15 | 未识别类型默认权重 |
+| REL_WEIGHT_RELATES | 0.15 | 共享实体边加成 |
+| REL_WEIGHT_COOCCUR | 0.10 | 共现边加成 |
+| BM25_ENABLED | false | 启用稀疏 BM25 融合 |
+| GRAPH_RANK_ENABLED | false | 启用度中心性加成 |
+| HASH_INCREMENTAL_ENABLED | false | Hash 增量跳过未变 chunk |
+| ENTITY_NORMALIZE_ENABLED | false | 启用实体同义标准化 |
+| ENTITY_MIN_LENGTH | 2 | 最小实体长度过滤 |
+| COOCCUR_MIN_COUNT | 2 | 共现边最小计数 |
+| EMBEDDING_MODEL | text-embedding-qwen3-embedding-0.6b | 嵌入模型名称 |
+| EMBEDDING_BATCH_SIZE | 64 | 初始嵌入批大小 |
+| EMBEDDING_TIMEOUT | 120 | 单批 HTTP 超时秒 |
+| EMBEDDING_MAX_RETRIES | 6 | 批拆分后单元最大重试 |
+| EMBEDDING_APPEND_EOS | false | 是否追加 EOS token |
+| EMBEDDING_EOS_TOKEN | "" | EOS token（空则退化为换行）|
+| GRAPH_RANK_WEIGHT | 0.1 | 度中心性加权系数 |
+| BM25_WEIGHT | 0.4 | BM25 归一得分权重 |
+| RERANK_ENABLED | false | 是否启用 rerank 占位阶段 |
+| RERANK_ALPHA | 0.5 | rerank 混合系数 |
+| EMBED_CACHE_MAX | 128 | 嵌入缓存容量 |
+| ANSWER_CACHE_MAX | 64 | 回答缓存容量 |
+| VECTOR_INDEX_NAME | chunk_embedding_index | 向量索引名 |
+| RELATION_LLM_TEMPERATURE | 0.0 | 关系抽取 LLM 温度 |
+| RELATION_EXTRACTION | true | 是否启用 :REL 抽取 |
+| DISABLE_ENTITY_EXTRACT | false | 关闭实体抽取阶段 |
+
+脚注：
+
+1. 关系类型权重建议控制在 0.05~0.3 之间，避免某单一类型主导。
+2. `EMBEDDING_APPEND_EOS=true` 且 `EMBEDDING_EOS_TOKEN` 为空时运行期会退化为追加换行符。
+3. 提升 `EMBEDDING_BATCH_SIZE` 可提高吞吐但增加超时风险（自适应拆分会缓解）。
+4. `HASH_INCREMENTAL_ENABLED` 仅在调用 `/ingest?incremental=true` 时起作用。
+5. 关闭 `RELATION_EXTRACTION` 可显著降低初次 ingest 时延。
 
 关键调参影响详见后文“调参手册”。
 

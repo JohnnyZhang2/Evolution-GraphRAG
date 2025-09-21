@@ -36,6 +36,7 @@ Currently no authentication layer. If you deploy externally, add a reverse proxy
 | GET | `/cache/stats` | Show embedding & answer cache sizes |
 | POST | `/cache/clear` | Clear caches |
 | POST | `/ranking/preview` | Show retrieval scoring breakdown (no LLM answer) |
+| GET | `/ingest/stream` | Server-Sent Events streaming ingest progress + final result |
 
 ## Versioning
 
@@ -98,6 +99,64 @@ Error (HTTP 500) example:
 {
   "detail": "some error; trace=Traceback ..."
 }
+```
+
+### 2.1 Streaming Ingest Progress (SSE)
+
+GET `/ingest/stream?path=/abs/file/or/dir&incremental=false&refresh=false&refresh_relations=true&checkpoint=true`
+
+Media Type: `text/event-stream`
+
+Event format examples (each ends with a blank line):
+
+```text
+event: start
+data: {}
+
+data: {"stage":"scan_input","detail":"path=/data/book.txt"}
+
+data: {"stage":"embedding_batch","detail":"batch_ok","current":3,"total":10}
+
+data: {"stage":"embedding_progress","current":320,"total":1300}
+
+data: {"stage":"relation_extraction","current":150,"total":860}
+
+event: result
+data: {"stage":"result","result":{"chunks_total":1300,"chunks_embedded":820,...}}
+
+data: {"stage":"done"}
+```
+
+Stages emitted mirror the synchronous `progress=true` array: scan_input, hash_computed, existing_scan, embedding / embedding_batch / embedding_progress, schema_index, entity_extraction, relates_to, relation_start, relation_extraction, relation_extraction_done, plus `done` and a synthetic `result` event with the final JSON.
+
+If an error occurs:
+
+```json
+{"stage":"error","error":"<message>"}
+```
+
+#### Checkpoint / Resume
+
+When `checkpoint=true` (default) the pipeline writes a JSON file `.ingest_ck_<basename>.json` alongside the source path. It records:
+
+```json
+{
+  "chunks": { "file::chunk_0": {"emb": true, "ent": true } },
+  "rel_pairs": { "file::chunk_0|file::chunk_1": {"rels":1} }
+}
+```
+
+Re-running the same ingest (without `refresh=true`) skips completed embeddings, entity extraction and processed relation pairs. Delete the checkpoint file or pass `refresh=true` to force a full rebuild.
+
+Notes:
+
+- Relation pair retries are not persisted yet; failed pairs are marked with `err` and skipped on resume.
+- For large corpora SSE keeps the client responsive without waiting for final JSON.
+
+Client example (curl will show raw events):
+
+```bash
+curl -N 'http://localhost:8010/ingest/stream?path=/data/book.txt&checkpoint=true'
 ```
 
 ## 3. Query

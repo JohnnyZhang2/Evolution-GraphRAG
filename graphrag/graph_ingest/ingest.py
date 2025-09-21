@@ -5,8 +5,9 @@
 # License: MIT (see LICENSE)
 
 import os
+import json
 from neo4j import GraphDatabase
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple, Set, Callable, Optional
 from ..config.settings import get_settings
 from ..utils.text_splitter import split_text
 from ..embedding.client import embed_texts
@@ -138,7 +139,7 @@ def read_file_content(path: str) -> str:
         return ''
 
 
-def ingest_path(path: str, incremental: bool = False, refresh: bool = False, refresh_relations: bool = True):
+def ingest_path(path: str, incremental: bool = False, refresh: bool = False, refresh_relations: bool = True, collect_progress: bool = False, checkpoint: bool = True, progress_callback: Optional[Callable[[Dict], None]] = None):
     """Ingest documents from path.
 
     Args:
@@ -151,7 +152,26 @@ def ingest_path(path: str, incremental: bool = False, refresh: bool = False, ref
     driver = get_driver()
     all_chunks: List[Tuple[str, str]] = []  # (id, text)
     source = os.path.abspath(path)
+    progress: List[Dict] = []
 
+    def record(stage: str, detail: str = "", current: int | None = None, total: int | None = None):
+        if not collect_progress:
+            return
+        item = {"stage": stage}
+        if detail:
+            item["detail"] = detail
+        if current is not None:
+            item["current"] = current
+        if total is not None:
+            item["total"] = total
+        progress.append(item)
+        if progress_callback:
+            try:
+                progress_callback(item)
+            except Exception as cb_e:
+                print(f"[PROGRESS CALLBACK WARN] {cb_e}")
+
+    record("scan_input", f"path={path}")
     if os.path.isdir(path):
         for root, _, files in os.walk(path):
             for fn in files:
@@ -172,16 +192,23 @@ def ingest_path(path: str, incremental: bool = False, refresh: bool = False, ref
 
     # 预计算所有 chunk hash
     chunk_hashes = {cid: hash_text(txt) for cid, txt in all_chunks}
+    record("hash_computed", current=len(chunk_hashes), total=len(chunk_hashes))
 
     # 如果启用 hash 增量，需要预取已存在 chunk 的 hash
     existing_hashes = {}
     existing_ids: Set[str] = set()
     if incremental or refresh or settings.hash_incremental_enabled:
+        # 避免 Neo4j 在库尚未有任何 hash 属性时返回 UnknownPropertyKeyWarning：
+        # 先探测是否存在至少一个 Chunk，再安全读取 hash。
         with get_driver().session() as session:
-            res = session.run("MATCH (c:Chunk) RETURN c.id AS id, c.hash AS hash")
-            for r in res:
-                existing_ids.add(r["id"])
-                existing_hashes[r["id"]] = r.get("hash")
+            probe = session.run("MATCH (c:Chunk) RETURN c.id AS id LIMIT 1").single()
+            if probe:
+                res = session.run("MATCH (c:Chunk) RETURN c.id AS id, c.hash AS hash")
+                for r in res:
+                    existing_ids.add(r["id"])
+                    existing_hashes[r["id"]] = r.get("hash")
+            # 若无任何 Chunk 节点，保持 existing_ids / hashes 为空即可
+        record("existing_scan", current=len(existing_ids))
 
     # 需要实际重嵌入的 chunk 列表（hash 新增或变化，或刷新模式）
     to_embed: List[Tuple[str, str]] = []
@@ -199,11 +226,60 @@ def ingest_path(path: str, incremental: bool = False, refresh: bool = False, ref
                     continue
             to_embed.append((cid, txt))
 
-    texts = [c[1] for c in to_embed]
-    vectors = embed_texts(texts) if to_embed else []
-    dim = len(vectors[0]) if vectors else 0
+    # ---- Checkpoint 文件路径 ----
+    ck_path = os.path.join(os.path.dirname(os.path.abspath(path if os.path.exists(path) else '.')), 
+                           f".ingest_ck_{os.path.basename(path).replace(os.sep,'_')}.json")
+    ck = {"chunks": {}, "entities_done": False, "rels_done": False, "rel_pairs": {}}
+    if checkpoint and os.path.exists(ck_path) and not refresh:
+        try:
+            with open(ck_path, 'r', encoding='utf-8') as cf:
+                ck = json.load(cf)
+            record("checkpoint_load", detail=ck_path)
+        except Exception as ce:
+            print(f"[CK WARN] load failed: {ce}")
+    # 过滤已完成 embedding 的 chunk（ck['chunks'][cid]['emb']=True）
+    pending_pairs = []
+    for cid, txt in to_embed:
+        meta = ck.get("chunks", {}).get(cid)
+        if meta and meta.get("emb") and not refresh:
+            continue
+        pending_pairs.append((cid, txt))
+    texts = [c[1] for c in pending_pairs]
+    from ..embedding.client import embed_texts_iter
+    dim = 0
+    if pending_pairs:
+        record("embedding", detail="start", current=0, total=len(to_embed))
+        collected = 0
+        driver_session = get_driver().session()
+        try:
+            for start_idx, vec_batch in embed_texts_iter(texts, progress_cb=lambda ev: record("embedding_batch", detail=ev.get("event",""), current=ev.get("batches_done"), total=ev.get("batches_total_initial"))):
+                # 将本批写入 Neo4j (UPSERT_CHUNK)
+                slice_pairs = pending_pairs[start_idx: start_idx + len(vec_batch)]
+                with driver_session.begin_transaction() as tx:
+                    for (cid, text), vec in zip(slice_pairs, vec_batch):
+                        tx.run(UPSERT_CHUNK, id=cid, text=text, embedding=vec, source=source, hash=chunk_hashes[cid])
+                if vec_batch:
+                    dim = len(vec_batch[0])
+                # 更新 checkpoint
+                if checkpoint:
+                    for (cid, _), _v in zip(slice_pairs, vec_batch):
+                        ck.setdefault("chunks", {}).setdefault(cid, {})["emb"] = True
+                    try:
+                        with open(ck_path, 'w', encoding='utf-8') as cf:
+                            json.dump(ck, cf, ensure_ascii=False, indent=2)
+                    except Exception as ws:
+                        print(f"[CK WARN] write failed: {ws}")
+                collected += len(vec_batch)
+                if collected % 50 == 0 or collected == len(texts):
+                    record("embedding_progress", current=collected, total=len(to_embed))
+            record("embedding", detail="done", current=len(to_embed), total=len(to_embed))
+        finally:
+            driver_session.close()
+    else:
+        record("embedding", detail="skip_all_cached", current=len(to_embed), total=len(to_embed))
 
     ensure_schema_and_index(driver, dim)
+    record("schema_index")
 
     # 校验：已存在向量索引维度与本次嵌入向量维度不一致时提示（仅警告不终止）
     try:
@@ -231,9 +307,10 @@ def ingest_path(path: str, incremental: bool = False, refresh: bool = False, ref
             # 删除派生关系（RELATES_TO / CO_OCCURS_WITH / REL）
             session.run("MATCH ()-[r:RELATES_TO|CO_OCCURS_WITH|REL]->() DELETE r")
 
-        # 写入需要重嵌入的 chunk
-        for (cid, text), vec in zip(to_embed, vectors):
-            session.run(UPSERT_CHUNK, id=cid, text=text, embedding=vec, source=source, hash=chunk_hashes[cid])
+        # 已改为批次即时写入；这里仅为兼容旧流程统计写入完成事件
+        if to_embed:
+            done_emb = sum(1 for cid,_ in to_embed if ck.get("chunks", {}).get(cid, {}).get("emb"))
+            record("chunks_written", current=done_emb, total=len(to_embed))
 
         # 对于未变化但尚未存 hash 的旧节点，补写 hash（无 embedding 重算）
         if (incremental or settings.hash_incremental_enabled) and not refresh:
@@ -249,6 +326,11 @@ def ingest_path(path: str, incremental: bool = False, refresh: bool = False, ref
         # 实体抽取（仅对重写入或刷新 chunk）
         if not settings.disable_entity_extract:
             changed_or_new_ids = {cid for cid, _ in to_embed} if not refresh else {cid for cid, _ in all_chunks}
+            # 跳过已做实体抽取的 chunk（checkpoint）
+            if checkpoint and not refresh:
+                changed_or_new_ids = {cid for cid in changed_or_new_ids if not ck.get("chunks", {}).get(cid, {}).get("ent")}
+            total_entity_targets = len(changed_or_new_ids)
+            processed_entities = 0
             for (cid, text) in ([c for c in all_chunks if c[0] in changed_or_new_ids]):
                 try:
                     raw_ents = extract_entities(text)
@@ -307,6 +389,19 @@ def ingest_path(path: str, incremental: bool = False, refresh: bool = False, ref
                             epairs.append({"e1": uniq[i], "e2": uniq[j]})
                     if epairs:
                         session.run(LINK_ENTITY_COOC, entityPairs=epairs)
+                # 标记 checkpoint
+                if checkpoint:
+                    ck.setdefault("chunks", {}).setdefault(cid, {})["ent"] = True
+                    try:
+                        with open(ck_path, 'w', encoding='utf-8') as cf:
+                            json.dump(ck, cf, ensure_ascii=False, indent=2)
+                    except Exception as ws:
+                        print(f"[CK WARN] write failed: {ws}")
+                processed_entities += 1
+                if processed_entities % 50 == 0:
+                    record("entity_extraction", current=processed_entities, total=total_entity_targets)
+            if total_entity_targets:
+                record("entity_extraction", current=total_entity_targets, total=total_entity_targets)
         if not settings.disable_entity_extract:
             # 基于共享实体创建 Chunk-Chuck RELATES_TO
             rel_cypher = """
@@ -324,12 +419,14 @@ def ingest_path(path: str, incremental: bool = False, refresh: bool = False, ref
             """
             try:
                 session.run(rel_cypher)
+                record("relates_to")
             except Exception as re:
                 print(f"[RELATES_TO WARN] {re}")
 
         # --- 高级关系抽取（基于 LLM） ---
-    if settings.relation_extraction and (not incremental or refresh_relations or refresh or not settings.hash_incremental_enabled):
+        if settings.relation_extraction and (not incremental or refresh_relations or refresh or not settings.hash_incremental_enabled):
             print(f"[REL-EXTRACT] starting relation extraction window={settings.relation_window}")
+            record("relation_start", detail=f"window={settings.relation_window}")
             window = max(1, settings.relation_window)
             REL_MERGE = """
             UNWIND $rels AS r
@@ -342,70 +439,115 @@ def ingest_path(path: str, incremental: bool = False, refresh: bool = False, ref
             created_rels = 0
             # 关系抽取范围：刷新模式使用全部；hash 增量时仅对发生变化的序列对做（简化：仍遍历全部，但跳过两端均未变化的配对）
             changed_set = {cid for cid, _ in to_embed} if (settings.hash_incremental_enabled and not refresh) else None
-            for i, (cid_i, text_i) in enumerate(all_chunks):
+            # 预估总 pair 数（用于进度显示）
+            total_pairs = 0
+            # 生成所有候选 pair，并为其分配顺序 index，支持断点
+            pairs_list: List[Tuple[str,str,int,int]] = []  # (cid_i, cid_j, i, j)
+            for i, (cid_i, _text_i) in enumerate(all_chunks):
                 for j in range(i+1, min(i+1+window, len(all_chunks))):
-                    cid_j, text_j = all_chunks[j]
-                    if changed_set is not None:
-                        if cid_i not in changed_set and cid_j not in changed_set:
-                            continue
-                    if settings.relation_debug:
-                        print(f"[REL-EXTRACT PAIR] {cid_i}->{cid_j} calling LLM")
-                    try:
-                        rels = extract_relations(
-                            cid_i, cid_j, text_i, text_j,
-                            max_chars=settings.relation_chunk_trunc,
-                            temperature=settings.relation_llm_temperature
-                        )
-                    except Exception as ree:
-                        print(f"[REL-EXTRACT WARN] {cid_i}->{cid_j} {ree}")
+                    cid_j, _ = all_chunks[j]
+                    if changed_set is not None and cid_i not in changed_set and cid_j not in changed_set:
                         continue
-                    if not rels:
-                        if settings.relation_debug:
-                            print(f"[REL-EXTRACT EMPTY] {cid_i}->{cid_j} no LLM relations")
-                        # Heuristic fallback: 如果两个 chunk 都较长且顺序上相邻，则认为 STEP_NEXT
-                        if len(text_i) > 80 and len(text_j) > 50:
-                            rels = [{
-                                "type": "STEP_NEXT",
-                                "direction": "forward",
-                                "confidence": settings.rel_fallback_confidence,
-                                "evidence": "heuristic_fallback"
-                            }]
-                            if settings.relation_debug:
-                                print(f"[REL-EXTRACT DEBUG] Fallback STEP_NEXT {cid_i}->{cid_j}")
-                        else:
-                            if settings.relation_debug:
-                                print(f"[REL-EXTRACT DEBUG] no relation {cid_i}->{cid_j}")
-                            continue
-                    # 方向处理：forward a->b; backward b->a; undirected 统一 a->b
-                    payload = []
-                    for r in rels:
-                        direction = r.get('direction', 'undirected')
-                        if direction == 'backward':
-                            payload.append({
-                                'src': cid_j,
-                                'dst': cid_i,
-                                'type': r.get('type', 'REL')[:30],
-                                'confidence': r.get('confidence', 0.5),
-                                'evidence': r.get('evidence', '')[:200]
-                            })
-                        else:
-                            payload.append({
-                                'src': cid_i,
-                                'dst': cid_j,
-                                'type': r.get('type', 'REL')[:30],
-                                'confidence': r.get('confidence', 0.5),
-                                'evidence': r.get('evidence', '')[:200]
-                            })
-                    if payload:
+                    pairs_list.append((cid_i, cid_j, i, j))
+            total_pairs = len(pairs_list)
+            # 过滤已处理 pair
+            remaining_pairs = []
+            rel_pairs_ck = ck.get("rel_pairs", {}) if checkpoint else {}
+            for (cid_i, cid_j, i, j) in pairs_list:
+                key = f"{cid_i}|{cid_j}"
+                if checkpoint and rel_pairs_ck.get(key):
+                    continue
+                remaining_pairs.append((cid_i, cid_j, i, j))
+            for (cid_i, cid_j, i, j) in remaining_pairs:
+                text_i = all_chunks[i][1]
+                text_j = all_chunks[j][1]
+                if settings.relation_debug:
+                    print(f"[REL-EXTRACT PAIR] {cid_i}->{cid_j} calling LLM")
+                try:
+                    rels = extract_relations(
+                        cid_i, cid_j, text_i, text_j,
+                        max_chars=settings.relation_chunk_trunc,
+                        temperature=settings.relation_llm_temperature
+                    )
+                except Exception as ree:
+                    print(f"[REL-EXTRACT WARN] {cid_i}->{cid_j} {ree}")
+                    # 标记失败也视为已处理以避免卡住（可选：写入 fail 标志）
+                    if checkpoint:
+                        ck.setdefault("rel_pairs", {})[f"{cid_i}|{cid_j}"] = {"err": True}
                         try:
-                            session.run(REL_MERGE, rels=payload)
-                            created_rels += len(payload)
-                        except Exception as me:
-                            print(f"[REL-MERGE WARN] {me}")
+                            with open(ck_path, 'w', encoding='utf-8') as cf:
+                                json.dump(ck, cf, ensure_ascii=False, indent=2)
+                        except Exception as ws:
+                            print(f"[CK WARN] write failed: {ws}")
+                    continue
+                if not rels:
+                    if settings.relation_debug:
+                        print(f"[REL-EXTRACT EMPTY] {cid_i}->{cid_j} no LLM relations")
+                    # Fallback STEP_NEXT
+                    if len(text_i) > 80 and len(text_j) > 50:
+                        rels = [{
+                            "type": "STEP_NEXT",
+                            "direction": "forward",
+                            "confidence": settings.rel_fallback_confidence,
+                            "evidence": "heuristic_fallback"
+                        }]
+                        if settings.relation_debug:
+                            print(f"[REL-EXTRACT DEBUG] Fallback STEP_NEXT {cid_i}->{cid_j}")
+                    else:
+                        if settings.relation_debug:
+                            print(f"[REL-EXTRACT DEBUG] no relation {cid_i}->{cid_j}")
+                        # 仍要标记已处理
+                        if checkpoint:
+                            ck.setdefault("rel_pairs", {})[f"{cid_i}|{cid_j}"] = {"empty": True}
+                            try:
+                                with open(ck_path, 'w', encoding='utf-8') as cf:
+                                    json.dump(ck, cf, ensure_ascii=False, indent=2)
+                            except Exception as ws:
+                                print(f"[CK WARN] write failed: {ws}")
+                        continue
+                payload = []
+                for r in rels:
+                    direction = r.get('direction', 'undirected')
+                    if direction == 'backward':
+                        payload.append({
+                            'src': cid_j,
+                            'dst': cid_i,
+                            'type': r.get('type', 'REL')[:30],
+                            'confidence': r.get('confidence', 0.5),
+                            'evidence': r.get('evidence', '')[:200]
+                        })
+                    else:
+                        payload.append({
+                            'src': cid_i,
+                            'dst': cid_j,
+                            'type': r.get('type', 'REL')[:30],
+                            'confidence': r.get('confidence', 0.5),
+                            'evidence': r.get('evidence', '')[:200]
+                        })
+                if payload:
+                    try:
+                        session.run(REL_MERGE, rels=payload)
+                        created_rels += len(payload)
+                    except Exception as me:
+                        print(f"[REL-MERGE WARN] {me}")
+                # 更新 checkpoint
+                if checkpoint:
+                    ck.setdefault("rel_pairs", {})[f"{cid_i}|{cid_j}"] = {"rels": len(payload)}
+                    try:
+                        with open(ck_path, 'w', encoding='utf-8') as cf:
+                            json.dump(ck, cf, ensure_ascii=False, indent=2)
+                    except Exception as ws:
+                        print(f"[CK WARN] write failed: {ws}")
+                if total_pairs:
+                    processed_pairs = len(rel_pairs_ck) + 1  # 近似：已在 ck 中的数量 + 当前
+                    if processed_pairs % 50 == 0:
+                        record("relation_extraction", current=processed_pairs, total=total_pairs)
             if created_rels:
                 print(f"[REL-EXTRACT INFO] created/updated {created_rels} relations (LLM + fallback)")
+                record("relation_extraction_done", detail=f"created={created_rels}")
             else:
                 print("[REL-EXTRACT INFO] no relations produced")
+                record("relation_extraction_done", detail="none")
 
     # --- 共现边清理（prune 低计数）---
     try:
@@ -418,7 +560,7 @@ def ingest_path(path: str, incremental: bool = False, refresh: bool = False, ref
         print(f"[PRUNE COOCCUR WARN] {pe}")
 
     driver.close()
-    return {
+    result = {
         "chunks_total": len(all_chunks),
         "chunks_embedded": len(to_embed),
         "chunks_unchanged": unchanged,
@@ -429,6 +571,9 @@ def ingest_path(path: str, incremental: bool = False, refresh: bool = False, ref
         "relation_extraction": settings.relation_extraction and (not incremental or refresh_relations or refresh or not settings.hash_incremental_enabled),
         "entity_normalize_enabled": settings.entity_normalize_enabled
     }
+    if collect_progress:
+        result["progress"] = progress
+    return result
 
 if __name__ == "__main__":
     import sys
