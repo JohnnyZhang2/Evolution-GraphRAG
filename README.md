@@ -1,4 +1,4 @@
-﻿# Evolution RAG 问答机器人 (本地 LLM)
+﻿# Evolution RAG
 
 [English README](./README.en.md) | **中文** | [详细功能说明](./docs/FEATURES.zh-CN.md) | [English Features](./docs/FEATURES.en.md)
 
