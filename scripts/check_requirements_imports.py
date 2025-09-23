@@ -33,6 +33,7 @@ REQ_FILE = os.path.join(REPO_ROOT, 'requirements.txt')
 OPTIONAL_PACKAGES = {
     'pytest',  # test only
     'python-dotenv',  # if later added
+    'scikit-learn',  # treat as optional (only needed if advanced rerank/ML features enabled)
 }
 
 # Mapping requirement name -> import module names to try

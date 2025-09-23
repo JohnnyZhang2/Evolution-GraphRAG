@@ -266,6 +266,7 @@ Fallback STEP_NEXT：使用 `REL_FALLBACK_CONFIDENCE * REL_WEIGHT_STEP_NEXT`。
 | Hash 增量 | `HASH_INCREMENTAL_ENABLED` | 已实现 | 未变 chunk 跳过重处理 |
 | 实体标准化 | `ENTITY_NORMALIZE_ENABLED` | 已实现 | ingest + query 同义聚合 |
 | 噪声控制 | `ENTITY_MIN_LENGTH` / `COOCCUR_MIN_COUNT` | 已实现 | 过滤短实体 & 剪枝低频共现 |
+| 实体类型抽取 & 关系白名单 | `ENTITY_TYPED_MODE` / `ENTITY_TYPES` / `RELATION_ENFORCE_TYPES` / `RELATION_TYPES` / `RELATION_FALLBACK_TYPE` | 已实现 | 约束图本体，过滤噪声关系类型 |
 | Rerank 占位 | `RERANK_ENABLED` | 占位 | 尚未引入外部模型 |
 
 ## 环境变量说明
@@ -314,6 +315,11 @@ Fallback STEP_NEXT：使用 `REL_FALLBACK_CONFIDENCE * REL_WEIGHT_STEP_NEXT`。
 | RELATION_LLM_TEMPERATURE | 0.0 | 关系抽取 LLM 温度 |
 | RELATION_EXTRACTION | true | 是否启用 :REL 抽取 |
 | DISABLE_ENTITY_EXTRACT | false | 关闭实体抽取阶段 |
+| ENTITY_TYPED_MODE | false | 启用后实体抽取返回 `[ {name,type} ]` 并写入 `Entity.type` (不覆盖已有) |
+| ENTITY_TYPES | Person,Organization,Location,Product,Concept,Event | 允许实体类型集合（逗号/分号/中文逗号分隔）|
+| RELATION_ENFORCE_TYPES | false | 启用后 :REL 仅保留白名单类型 |
+| RELATION_TYPES | STEP_NEXT,CAUSES,SUPPORTS,REFERENCES,PART_OF,SUBSTEP_OF,CONTRASTS | 允许的语义关系类型 |
+| RELATION_FALLBACK_TYPE | STEP_NEXT | 强制模式下未知类型替换；为空=直接丢弃 |
 
 脚注：
 
@@ -324,6 +330,24 @@ Fallback STEP_NEXT：使用 `REL_FALLBACK_CONFIDENCE * REL_WEIGHT_STEP_NEXT`。
 5. 关闭 `RELATION_EXTRACTION` 可显著降低初次 ingest 时延。
 
 关键调参影响详见后文“调参手册”。
+
+### 实体类型 & 关系白名单使用指南
+
+1. `ENTITY_TYPED_MODE=true` 并调整 `ENTITY_TYPES`
+2. 观察日志（可加临时调试）确认实际抽取类型
+3. `RELATION_ENFORCE_TYPES=true` 后设置精简 `RELATION_TYPES`
+4. 需要降级保留则设 `RELATION_FALLBACK_TYPE=STEP_NEXT`
+5. 全量或刷新 ingest 回填历史节点类型
+
+注意：采用 `COALESCE` 不覆盖已有 `type`；需重算先手动移除。
+
+重置示例：
+
+```cypher
+MATCH (e:Entity) REMOVE e.type;
+```
+
+调试：初期设 `RELATION_LLM_TEMPERATURE=0` 减少漂移，加速白名单收敛。
 
 ## 关系构建细节
 

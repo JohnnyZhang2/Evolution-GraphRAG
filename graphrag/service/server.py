@@ -15,6 +15,7 @@ from ..utils.graph_rank import get_degree_scores
 from ..config.settings import get_settings
 from ..utils.diagnostics import run_all as run_diagnostics
 from ..retriever.retrieve import build_prompt
+from ..llm.client import extract_relations
 
 settings = get_settings()
 
@@ -48,11 +49,18 @@ def ingest(
 
 @app.get("/ingest/stream")
 def ingest_stream(
-    path: str = Query(..., description="文件或目录绝对路径"),
-    incremental: bool = Query(False),
-    refresh: bool = Query(False),
-    refresh_relations: bool = Query(True),
-    checkpoint: bool = Query(True),
+    path: str = Query(..., description="文件或目录绝对路径 或 用于关系增量补齐的 source 路径"),
+    incremental: bool = Query(False, description="常规增量：仅新增/变化 chunk 做嵌入与实体"),
+    refresh: bool = Query(False, description="刷新：重做实体/共现/RELATES_TO 及可选 LLM 关系"),
+    refresh_relations: bool = Query(True, description="刷新模式下是否重新跑 LLM 关系"),
+    checkpoint: bool = Query(True, description="启用断点续跑"),
+    inc_rel_only: bool = Query(False, description="仅做新增区间 LLM 语义关系补齐(不嵌入/不抽实体)"),
+    new_after: str | None = Query(None, description="旧区间最后一个 chunk id，之后视为新增"),
+    detect_after: bool = Query(False, description="自动探测旧/新增分界，需要提供 new_count"),
+    new_count: int | None = Query(None, description="最近新增 chunk 数量 (与 detect_after 搭配)"),
+    rel_window: int = Query(settings.relation_window, description="关系窗口大小，用于 inc_rel_only"),
+    rel_truncate: int = Query(settings.relation_chunk_trunc, description="关系抽取截断字符"),
+    rel_temperature: float = Query(settings.relation_llm_temperature, description="关系抽取温度"),
 ):
     """通过 SSE 流式推送 ingest 进度事件。
 
@@ -71,6 +79,136 @@ def ingest_stream(
 
     def worker():
         try:
+            # --- 仅关系增量模式 ---
+            if inc_rel_only:
+                # 校验参数
+                if not new_after and not (detect_after and new_count):
+                    raise ValueError("inc_rel_only 模式需要提供 new_after 或 (detect_after + new_count)")
+                from neo4j import GraphDatabase
+                driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password))
+                created = 0
+                skipped = 0
+                pairs_total = 0
+                try:
+                    with driver.session() as session:
+                        # 读取指定 source 的所有 chunk
+                        recs = session.run("MATCH (c:Chunk {source:$s}) RETURN c.id AS id, c.text AS text ORDER BY c.id", s=path)
+                        chunks = [(r["id"], r["text"]) for r in recs]
+                        if not chunks:
+                            raise ValueError("未找到指定 source 的任何 Chunk，请确认已先完成 ingest")
+                        ids = [c[0] for c in chunks]
+                        # 自动探测分界
+                        if detect_after:
+                            if not new_count or new_count >= len(ids):
+                                raise ValueError("detect_after 需要合理的 new_count 且小于总 chunk 数")
+                            split_index = len(ids) - new_count - 1
+                            new_after_id = ids[split_index]
+                        else:
+                            if new_after not in ids:
+                                raise ValueError(f"提供的 new_after 不在当前 chunk 集合: {new_after}")
+                            new_after_id = new_after  # type: ignore
+                        new_index_start = ids.index(new_after_id) + 1
+                        new_ids = ids[new_index_start:]
+                        old_ids = ids[:new_index_start]
+                        if not new_ids:
+                            q.put({"stage": "relation_incremental_done", "created": 0, "skipped": 0, "pairs": 0, "detail": "无新增 chunk"})
+                            q.put({"stage": "result", "result": {"mode": "relations_incremental", "created": 0, "skipped": 0, "pairs": 0, "old": len(old_ids), "new": len(new_ids)}})
+                            q.put({"stage": "done"})
+                            return
+                        window = max(1, rel_window)
+                        tail_old = old_ids[-window:]
+                        pairs: list[tuple[str,str]] = []
+                        # new 内部窗口配对
+                        for i, src in enumerate(new_ids):
+                            for j in range(i+1, min(i+1+window, len(new_ids))):
+                                pairs.append((src, new_ids[j]))
+                        # old 尾部 -> 前若干 new（保持与 CLI 一致：仅前 window 个 new）
+                        for o in tail_old:
+                            for n in new_ids[:window]:
+                                pairs.append((o, n))
+                        # 去重
+                        seen = set()
+                        dedup_pairs = []
+                        for p in pairs:
+                            if p not in seen:
+                                seen.add(p)
+                                dedup_pairs.append(p)
+                        pairs = dedup_pairs
+                        pairs_total = len(pairs)
+                        q.put({"stage": "relation_incremental_start", "old": len(old_ids), "new": len(new_ids), "window": window, "pairs": pairs_total})
+                        # 为快速查 text 建立 map
+                        text_map = {cid: txt for cid, txt in chunks}
+                        # 查询已存在 (src,dst,type)
+                        involved_ids = list({p[0] for p in pairs} | {p[1] for p in pairs})
+                        existing_rels = session.run(
+                            """
+                            UNWIND $lst AS x
+                            UNWIND $lst AS y
+                            WITH x,y WHERE x<>y
+                            MATCH (a:Chunk {id:x})-[r:REL]->(b:Chunk {id:y})
+                            RETURN a.id AS src, b.id AS dst, r.type AS type
+                            """, lst=involved_ids
+                        )
+                        existing = {(r["src"], r["dst"], r["type"]) for r in existing_rels}
+                        REL_MERGE = """
+                        UNWIND $rels AS r
+                        MATCH (a:Chunk {id:r.src})
+                        MATCH (b:Chunk {id:r.dst})
+                        MERGE (a)-[rel:REL {type:r.type}]->(b)
+                        ON CREATE SET rel.confidence=r.confidence, rel.evidence=r.evidence, rel.createdAt=timestamp()
+                        ON MATCH SET rel.confidence=(rel.confidence + r.confidence)/2.0, rel.evidence=r.evidence
+                        """
+                        processed = 0
+                        for (src, dst) in pairs:
+                            try:
+                                rels = extract_relations(src, dst, text_map[src], text_map[dst], max_chars=rel_truncate, temperature=rel_temperature)
+                            except Exception as ee:
+                                q.put({"stage": "relation_incremental_warn", "pair": f"{src}->{dst}", "error": str(ee)})
+                                processed += 1
+                                continue
+                            if not rels:
+                                processed += 1
+                                if processed % 20 == 0:
+                                    q.put({"stage": "relation_incremental_progress", "processed": processed, "total": pairs_total, "created": created, "skipped": skipped})
+                                continue
+                            payload = []
+                            for r in rels:
+                                direction = r.get('direction','undirected')
+                                if direction == 'backward':
+                                    s, d = dst, src
+                                else:
+                                    s, d = src, dst
+                                key = (s, d, r.get('type','REL')[:30])
+                                if key in existing:
+                                    skipped += 1
+                                    continue
+                                payload.append({
+                                    'src': s,
+                                    'dst': d,
+                                    'type': r.get('type','REL')[:30],
+                                    'confidence': r.get('confidence',0.5),
+                                    'evidence': r.get('evidence','')[:200]
+                                })
+                            if payload:
+                                try:
+                                    session.run(REL_MERGE, rels=payload)
+                                    for p in payload:
+                                        existing.add((p['src'], p['dst'], p['type']))
+                                    created += len(payload)
+                                except Exception as me:
+                                    q.put({"stage": "relation_incremental_warn", "pair": f"{src}->{dst}", "error": str(me)})
+                            processed += 1
+                            if processed % 20 == 0 or processed == pairs_total:
+                                q.put({"stage": "relation_incremental_progress", "processed": processed, "total": pairs_total, "created": created, "skipped": skipped})
+                    # 汇总
+                    result = {"mode": "relations_incremental", "created": created, "skipped": skipped, "pairs": pairs_total, "old": len(old_ids), "new": len(new_ids)}
+                    q.put({"stage": "relation_incremental_done", **result})
+                    q.put({"stage": "result", "result": result})
+                    q.put({"stage": "done"})
+                finally:
+                    driver.close()
+                return
+            # --- 正常 ingest 模式 ---
             result = ingest_path(
                 path,
                 incremental=incremental,

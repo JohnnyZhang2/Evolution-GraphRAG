@@ -28,6 +28,7 @@
 ## 1. 健康检查
 
 ### GET /health
+
 返回服务基本可用性与 API 版本。
 
 响应示例：
@@ -39,6 +40,7 @@
 ## 2. 文档导入
 
 ### POST /ingest
+
 对单个文件或目录执行：切分 → 嵌入（含哈希跳过）→ 实体抽取/标准化 → 共现 / 共享实体 → LLM 语义关系。
 
 Query 参数（全部可选）：
@@ -125,7 +127,54 @@ data: {"stage":"done"}
 curl -N 'http://localhost:8010/ingest/stream?path=/data/book.txt&checkpoint=true'
 ```
 
-#### 2.1.1 断点续传 / Checkpoint
+#### 2.1.1 仅语义关系增量补齐 (relations-only)
+
+如果你只是追加了一段新内容（生成了一批新的 chunk），希望“只补齐新增区间的 LLM 语义关系”而不再重复嵌入/实体抽取，可使用流式接口的关系增量模式：
+
+```text
+GET /ingest/stream?path=/绝对路径/原文件.txt&inc_rel_only=true&new_after=<最后旧chunk id>&rel_window=2
+```
+
+或当你只知道新增了多少个 chunk，可以自动探测分界：
+
+```text
+GET /ingest/stream?path=/绝对路径/原文件.txt&inc_rel_only=true&detect_after=true&new_count=8
+```
+
+启用 `inc_rel_only=true` 后，其它新增参数含义：
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| path | 是 | 必须与最初 ingest 写入的 `Chunk.source` 相同（绝对路径）|
+| inc_rel_only | 是 | 打开仅关系增量模式 |
+| new_after | 二选一 | 指定“旧区间最后一个 chunk id” (其后视为新增) |
+| detect_after + new_count | 二选一 | 自动将最后 `new_count` 个 chunk 视为新增 |
+| rel_window | 否 | 滑动窗口大小（默认使用全局配置 `relation_window`）|
+| rel_truncate | 否 | 每个 chunk 截断字符数（限制 LLM 提示长度）|
+| rel_temperature | 否 | LLM 温度 |
+
+该模式下会出现新增的阶段事件：
+
+```text
+data: {"stage":"relation_incremental_start","old":120,"new":8,"window":2,"pairs":34}
+data: {"stage":"relation_incremental_progress","processed":10,"total":34,"created":5,"skipped":3}
+data: {"stage":"relation_incremental_warn","pair":"chunk_119::chunk_121","error":"timeout"}
+data: {"stage":"relation_incremental_done","created":12,"skipped":9,"pairs":34,"old":120,"new":8}
+event: result
+data: {"stage":"result","result":{"mode":"relations_incremental","created":12,"skipped":9,"pairs":34,"old":120,"new":8}}
+data: {"stage":"done"}
+```
+
+说明：
+
+- 仅考虑“新增区间内部互相”以及“旧区间尾部 window 个 vs 新增区间前 window 个”这两类配对。
+- 已存在 (src,dst,type) 的 :REL 会跳过，不做删除，仅新增缺失类型。
+- 边界估计错了可以重新执行（对已存在类型幂等，不会重复创建）。
+- 大图请保持较小 `rel_window` 以控制调用量。
+
+若发现漏补或窗口不足，可再次 relations-only 模式补跑；需要彻底重建可使用 `refresh=true` 走完整流程。
+
+#### 2.1.2 断点续传 / Checkpoint
 
 当 `checkpoint=true`（默认）时，系统会在源文件或目录同级写入一个 `.ingest_ck_<basename>.json`：
 
@@ -162,6 +211,7 @@ curl -N 'http://localhost:8010/ingest/stream?path=/data/book.txt&checkpoint=true
 ## 3. 提问接口
 
 ### POST /query
+
 执行向量检索 +（可选）图扩展 + 混合打分 +（可选）Rerank（占位）+ LLM 生成 + 引用后处理。
 
 请求体：
@@ -180,6 +230,7 @@ curl -N 'http://localhost:8010/ingest/stream?path=/data/book.txt&checkpoint=true
 | stream | bool | 否 | true | 是否采用流式输出（逐段返回回答文本）|
 
 #### 3.1 流式模式
+
 请求示例：
 
 ```bash
@@ -188,7 +239,8 @@ curl -N -X POST http://localhost:8000/query \
   -d '{"question":"Explain architecture","stream":true}'
 ```
 响应为文本流，末尾附带一个 SOURCES 块：
-```
+
+```text
 部分回答内容...
 更多回答内容...
 
@@ -197,7 +249,9 @@ curl -N -X POST http://localhost:8000/query \
 - 2. chunk_11 (rank=2, reason=llm_rel, score=0.77)
 ```
 
+ 
 #### 3.2 非流式模式
+
 请求示例：
 
 ```bash
@@ -251,6 +305,7 @@ curl -X POST http://localhost:8000/query \
 ## 4. 诊断接口
 
 ### GET /diagnostics
+
 提供当前特性状态、图统计与噪声控制参数，便于调参与监控。
 
 示例响应（截断）：
@@ -300,6 +355,7 @@ curl -X POST http://localhost:8000/query \
   "answer_cache_keys": ["Explain architecture"]
 }
 ```
+
 
 ### POST /cache/clear
 清空运行期内存缓存。

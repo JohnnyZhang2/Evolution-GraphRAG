@@ -6,6 +6,8 @@
 
 A locally deployable GraphRAG (Graph‑enhanced Retrieval Augmented Generation) system that fuses multiple retrieval signals:
 
+> Note: Settings layer migrated to Pydantic v2 (using field `alias` instead of deprecated `env=`). If your fork shows deprecation warnings, rebase/merge this change.
+
 - Vector similarity (Neo4j native vector index)
 - Graph structure (shared entities, co-occurrence, semantic relations)
 - Optional BM25 sparse scoring
@@ -77,9 +79,54 @@ curl -X POST http://localhost:8000/query \
 | Hash incremental | HASH_INCREMENTAL_ENABLED | implemented | skip unchanged chunks |
 | Entity normalization | ENTITY_NORMALIZE_ENABLED | implemented | ingest + query synonyms |
 | Noise control | ENTITY_MIN_LENGTH / COOCCUR_MIN_COUNT | implemented | filter + prune |
+| Typed entities & relation whitelist | ENTITY_TYPED_MODE / ENTITY_TYPES / RELATION_ENFORCE_TYPES / RELATION_TYPES / RELATION_FALLBACK_TYPE | implemented | Restrict ontology + persist `Entity.type` |
 | Rerank placeholder | RERANK_ENABLED | placeholder | no reordering yet |
 
-Full variable list: see `.env` + feature guide.
+Full variable list: see `.env` + feature guide. Typed entity & relation schema explained below.
+
+### Typed Entity & Relation Schema Quickstart
+
+Use when you need to:
+
+1. Extract only specific entity classes (Person / Organization / ...)
+2. Enforce a curated semantic relation label set (drop or fallback others)
+
+Variables (defaults defined in `settings.py`):
+
+| Variable | Example Default | Description |
+|----------|-----------------|-------------|
+| `ENTITY_TYPED_MODE` | false | Enables structured entity output `[ {name,type} ]`, persists `Entity.type` (never overwrites) |
+| `ENTITY_TYPES` | Person,Organization,Location,Product,Concept,Event | Allowed entity types (comma / semicolon; whitespace ignored) |
+| `RELATION_ENFORCE_TYPES` | false | If true, keep only whitelisted semantic relations |
+| `RELATION_TYPES` | STEP_NEXT,CAUSES,SUPPORTS,REFERENCES,PART_OF,SUBSTEP_OF,CONTRASTS | Allowed relation type set |
+| `RELATION_FALLBACK_TYPE` | STEP_NEXT | Replacement for non-whitelisted types (blank => drop) |
+
+Recommended sequence:
+
+1. Enable `ENTITY_TYPED_MODE` + set `ENTITY_TYPES`
+2. (Optional) Enable `RELATION_ENFORCE_TYPES` with tuned `RELATION_TYPES`
+3. (Optional) Add `RELATION_FALLBACK_TYPE=STEP_NEXT`
+4. Run full ingest or `refresh=true` to backfill `Entity.type`
+5. Incremental runs skip unchanged chunks (hash)
+
+Caveats:
+
+- `COALESCE` prevents overwriting existing types; clear manually to recompute.
+- With normalization, matching uses canonical names.
+- Over-restricting early may reduce semantic connectivity; iterate gradually.
+- Non-whitelisted relations w/o fallback are dropped.
+
+Example `.env`:
+
+```env
+ENTITY_TYPED_MODE=true
+ENTITY_TYPES=Person,Organization,Event
+RELATION_ENFORCE_TYPES=true
+RELATION_TYPES=CAUSES,SUPPORTS,PART_OF,SUBSTEP_OF,STEP_NEXT
+RELATION_FALLBACK_TYPE=STEP_NEXT
+```
+
+Diagnostics: `/diagnostics` -> `feature_flags`.
 
 ## 📦 Query Response (Non‑stream)
 

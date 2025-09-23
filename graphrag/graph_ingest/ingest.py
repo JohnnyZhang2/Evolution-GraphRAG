@@ -339,16 +339,19 @@ def ingest_path(path: str, incremental: bool = False, refresh: bool = False, ref
                     continue
                 if not raw_ents:
                     continue
+                # 兼容 typed 模式：提取原始 name 列表供后续清洗
+                if settings.entity_typed_mode and raw_ents and isinstance(raw_ents[0], dict):
+                    raw_names = [e.get('name','').strip() for e in raw_ents if isinstance(e, dict)]
+                else:
+                    raw_names = [ (e.strip() if isinstance(e,str) else '') for e in raw_ents ]
                 # 噪声过滤：长度 < entity_min_length 或全部是符号/标点则丢弃
                 cleaned = []
                 import re
-                for r in raw_ents:
-                    if r is None:
+                for rs in raw_names:
+                    if not rs:
                         continue
-                    rs = r.strip()
                     if len(rs) < settings.entity_min_length:
                         continue
-                    # 只包含标点/空白的跳过
                     if not re.search(r"[\w\u4e00-\u9fa5]", rs):
                         continue
                     cleaned.append(rs)
@@ -373,6 +376,29 @@ def ingest_path(path: str, incremental: bool = False, refresh: bool = False, ref
                     alias_payload = []
 
                 session.run(MERGE_ENTITY, entities=ents)
+                # 写入实体类型（entity_typed_mode 下 extract_entities 返回 dict 列表，我们已展开为 ents 名称列表且保留映射）
+                if settings.entity_typed_mode and raw_ents and isinstance(raw_ents[0], dict):
+                    try:
+                        name_type_pairs = {}
+                        for tr in raw_ents:
+                            if not isinstance(tr, dict):
+                                continue
+                            nm = tr.get('name'); tp = tr.get('type')
+                            if not nm or not tp:
+                                continue
+                            # 若标准化开启，映射到 canonical
+                            key_name = normalize_entity(nm) if settings.entity_normalize_enabled else nm
+                            if key_name in ents:
+                                name_type_pairs.setdefault(key_name, tp)
+                        if name_type_pairs:
+                            rows = [{'name': k, 'type': v} for k,v in name_type_pairs.items()]
+                            session.run("""
+                            UNWIND $rows AS r
+                            MATCH (e:Entity {name:r.name})
+                            SET e.type = COALESCE(e.type, r.type)
+                            """, rows=rows)
+                    except Exception as te:
+                        print(f"[ENTITY TYPE WARN] {te}")
                 if alias_payload:
                     try:
                         session.run(SET_ALIASES_IF_EMPTY, rows=alias_payload)

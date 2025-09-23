@@ -343,6 +343,29 @@ Footnotes:
 
 Adjusting these impacts recall, precision, latency, and hallucination risk. See Tuning Guide.
 
+### Typed Entity & Relation Whitelist Guide
+
+1. Enable `ENTITY_TYPED_MODE=true` & configure `ENTITY_TYPES`.
+2. Inspect logs for extracted type distribution.
+3. (Optional) Turn on `RELATION_ENFORCE_TYPES=true` and narrow `RELATION_TYPES`.
+4. (Optional) Set `RELATION_FALLBACK_TYPE=STEP_NEXT` for graceful downgrade.
+5. Run full ingest / refresh to backfill `Entity.type`.
+
+Notes:
+
+- Existing `Entity.type` preserved (COALESCE); remove to recompute.
+- Canonical name matching applies when normalization on.
+- Start broad; tighten whitelist after observing impact.
+- Unknown types dropped if no fallback.
+
+Reset example:
+
+```cypher
+MATCH (e:Entity) REMOVE e.type;
+```
+
+Debug tip: `RELATION_LLM_TEMPERATURE=0` reduces label variance during curation.
+
 ## Relation Construction
 
 | Type | Generation | Direction | Properties | Notes |

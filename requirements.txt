@@ -1,8 +1,8 @@
 fastapi
 uvicorn
 neo4j
-pydantic
-pydantic-settings
+pydantic>=2.4,<3.0
+pydantic-settings>=2.0,<3.0
 python-dotenv
 requests
 tenacity

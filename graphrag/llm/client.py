@@ -1,5 +1,5 @@
 import requests
-from typing import List, Optional, Generator, Dict
+from typing import List, Optional, Generator, Dict, Union
 from tenacity import retry, stop_after_attempt, wait_exponential
 import codecs
 from ..config.settings import get_settings
@@ -64,18 +64,35 @@ def chat_completion(messages: List[dict], stream: bool = True, temperature: floa
             yield content
 
 
-def extract_entities(text: str, language: str = "auto") -> List[str]:
-    """利用 LLM 抽取实体（命名实体/关键术语）。"""
-    system_prompt = (
-        "You are an information extraction assistant. Given text, extract a concise list of domain entities (persons, organizations, key concepts, products, locations, technical terms). "
-        "Return JSON with unique entities in array 'entities'. If none, return empty array. Use original language."
-    )
+def _parse_csv_list(raw: str) -> List[str]:
+    return [x.strip() for x in raw.split(',') if x.strip()]
+
+def extract_entities(text: str, language: str = "auto") -> List[Union[str, Dict]]:
+    """利用 LLM 抽取实体。
+
+    返回：
+      - entity_typed_mode = False: List[str]
+      - entity_typed_mode = True : List[{"name": str, "type": str}]
+    """
+    etypes = _parse_csv_list(settings.entity_types)
+    if settings.entity_typed_mode:
+        system_prompt = (
+            "You are an information extraction assistant. Extract domain entities with their type from the text. "
+            f"Allowed entity types ONLY: {', '.join(etypes)}. "
+            "Return STRICT JSON: {\"entities\":[{\"name\":str,\"type\":str}]}. "
+            "No explanations; omit duplicates; preserve original surface form for name."
+        )
+    else:
+        system_prompt = (
+            "You are an information extraction assistant. Given text, extract a concise list of domain entities (persons, organizations, key concepts, products, locations, technical terms). "
+            "Return JSON with unique entities in array 'entities'. If none, return empty array. Use original language."
+        )
     user_prompt = f"Text:\n{text}\nLanguage hint:{language}"
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt}
     ]
-    collected = []
+    collected: List[Union[str, Dict]] = []
     buffer = ""
     for chunk in chat_completion(messages, stream=True, temperature=0.0):
         buffer += chunk
@@ -87,7 +104,23 @@ def extract_entities(text: str, language: str = "auto") -> List[str]:
             data = json.loads(json_match.group())
             ents = data.get("entities", [])
             if isinstance(ents, list):
-                collected = list({e.strip(): None for e in ents if isinstance(e, str) and e.strip()})
+                if settings.entity_typed_mode:
+                    norm: Dict[str, Dict] = {}
+                    for e in ents:
+                        if not isinstance(e, dict):
+                            continue
+                        name = (e.get("name") or "").strip()
+                        etype = (e.get("type") or "").strip()
+                        if not name or not etype:
+                            continue
+                        if etype not in etypes:
+                            continue
+                        # 首次为准
+                        norm.setdefault(name, {"name": name, "type": etype})
+                    collected = list(norm.values())
+                else:
+                    uniq = list({( (e.strip() if isinstance(e, str) else "") ): None for e in ents if isinstance(e, str) and e.strip()})
+                    collected = [u for u in uniq if u]
         except Exception:
             pass
     return list(collected)
@@ -102,10 +135,16 @@ def extract_relations(src_id: str, dst_id: str, src_text: str, dst_text: str, ma
     # 截断文本避免 prompt 过长
     st = (src_text[:max_chars] + ('...' if len(src_text) > max_chars else ''))
     dt = (dst_text[:max_chars] + ('...' if len(dst_text) > max_chars else ''))
+    allowed_rel_types = _parse_csv_list(settings.relation_types)
+    rel_hint = ""
+    if settings.relation_enforce_types:
+        rel_hint = f"Allowed relation types ONLY: {', '.join(allowed_rel_types)}. Invalid types -> omit. "
+    else:
+        rel_hint = f"Relation types examples: {', '.join(allowed_rel_types)}. "
     system_prompt = (
         "You are a relationship extraction assistant. Given two text chunks (A and B), identify any meaningful relationships. "
         "Return STRICT JSON: {\"relations\":[{\"type\":str,\"direction\":'forward'|'backward'|'undirected',\"confidence\":0-1,\"evidence\":str}]}. "
-        "Types examples: STEP_NEXT, CAUSES, PART_OF, SUBSTEP_OF, FOLLOWS, REFERENCES, CONTRASTS, SUPPORTS. If none, return empty array."
+        + rel_hint + "If none, return {\"relations\":[]} only."
     )
     user_prompt = f"ChunkA(id={src_id}):\n{st}\n\nChunkB(id={dst_id}):\n{dt}\n\nExtract relations."
     messages = [
@@ -150,6 +189,13 @@ def extract_relations(src_id: str, dst_id: str, src_text: str, dst_text: str, ma
                     rtype = r.get("type")
                     if not rtype or not isinstance(rtype, str):
                         continue
+                    rtype = rtype.strip()[:40]
+                    if settings.relation_enforce_types and rtype not in allowed_rel_types:
+                        # fallback or skip
+                        if settings.relation_fallback_type:
+                            rtype = settings.relation_fallback_type
+                        else:
+                            continue
                     direction = r.get("direction", "undirected")
                     if direction not in ("forward", "backward", "undirected"):
                         direction = "undirected"
@@ -160,7 +206,7 @@ def extract_relations(src_id: str, dst_id: str, src_text: str, dst_text: str, ma
                         conf = 0.5
                     evidence = r.get("evidence") or ""
                     rels.append({
-                        "type": rtype[:40],
+                        "type": rtype,
                         "direction": direction,
                         "confidence": max(0.0, min(1.0, conf)),
                         "evidence": evidence[:200]

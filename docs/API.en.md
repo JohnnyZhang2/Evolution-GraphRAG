@@ -135,6 +135,53 @@ If an error occurs:
 {"stage":"error","error":"<message>"}
 ```
 
+#### Relations-Only Incremental (semantic patch)
+
+When you only appended new chunks and want to supplement LLM semantic relations without re-running embedding/entity phases you can call the same streaming endpoint in relations-only mode:
+
+```text
+GET /ingest/stream?path=/abs/source/file.txt&inc_rel_only=true&new_after=<last_old_chunk_id>&rel_window=2
+```
+
+Or automatic boundary detection if you just know how many new chunks were appended:
+
+```text
+GET /ingest/stream?path=/abs/source/file.txt&inc_rel_only=true&detect_after=true&new_count=8
+```
+
+Parameters (active only when `inc_rel_only=true`):
+
+| Param | Required | Description |
+|-------|----------|-------------|
+| path | yes | Must equal the original absolute file path used during ingest (matches `Chunk.source`) |
+| inc_rel_only | yes | Enable relations-only incremental mode |
+| new_after | one of | Explicit last old chunk id (exclusive boundary) |
+| detect_after + new_count | one of | Auto pick boundary: treat last `new_count` chunks as new |
+| rel_window | optional | Sliding window size (default = global `relation_window`) |
+| rel_truncate | optional | Per chunk truncation characters (prompt length control) |
+| rel_temperature | optional | LLM temperature override |
+
+Emitted incremental relation stages:
+
+```text
+data: {"stage":"relation_incremental_start","old":120,"new":8,"window":2,"pairs":34}
+data: {"stage":"relation_incremental_progress","processed":10,"total":34,"created":5,"skipped":3}
+data: {"stage":"relation_incremental_warn","pair":"chunk_119::chunk_121","error":"timeout"}
+data: {"stage":"relation_incremental_done","created":12,"skipped":9,"pairs":34,"old":120,"new":8}
+event: result
+data: {"stage":"result","result":{"mode":"relations_incremental","created":12,"skipped":9,"pairs":34,"old":120,"new":8}}
+data: {"stage":"done"}
+```
+
+Notes:
+
+- Only new-new and tail-old to early-new pairs inside the window are considered.
+- Existing (src,dst,type) :REL edges are skipped; no deletions performed.
+- Safe to re-run with corrected boundary (idempotent for existing types, confidence averaging still only applies in full ingest path).
+- Keep `rel_window` small for large graphs to limit LLM calls.
+
+If boundary was wrong you can re-run relations-only with the right `new_after` or fall back to a full refresh (`refresh=true`).
+
 #### Checkpoint / Resume
 
 When `checkpoint=true` (default) the pipeline writes a JSON file `.ingest_ck_<basename>.json` alongside the source path. It records:

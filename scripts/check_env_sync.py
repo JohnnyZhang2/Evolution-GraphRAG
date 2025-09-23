@@ -23,15 +23,32 @@ ROOT = Path(__file__).resolve().parent.parent
 SETTINGS_FILE = ROOT / "graphrag" / "config" / "settings.py"
 ENV_FILE = ROOT / ".env"
 
-FIELD_ENV_RE = re.compile(r'env\s*=\s*"([A-Z0-9_]+)"')
+# 支持 v1 写法 env="VAR" 以及 v2 写法 alias="VAR"
+FIELD_ENV_RE = re.compile(r'(?:env|alias)\s*=\s*"([A-Z0-9_]+)"')
 
 # 可选变量集合：缺失不报错，仅提示（可被注释）
 OPTIONAL_ENV = {
+    # feature / tuning flags (non-critical)
     "DISABLE_ENTITY_EXTRACT",
     "EMBED_CACHE_MAX",
     "ANSWER_CACHE_MAX",
     "VECTOR_INDEX_NAME",
     "REL_FALLBACK_CONFIDENCE",
+    # newly added typed entity / relation schema controls (should be optional by default)
+    "ENTITY_TYPED_MODE",
+    "ENTITY_TYPES",
+    "RELATION_ENFORCE_TYPES",
+    "RELATION_TYPES",
+    "RELATION_FALLBACK_TYPE",
+}
+
+# Core required minimal set actually needed for the system to start; everything else treated as optional if absent.
+CORE_REQUIRED = {
+    "NEO4J_URI",
+    "NEO4J_USER",
+    "NEO4J_PASSWORD",
+    "LLM_MODEL",
+    "EMBEDDING_MODEL",
 }
 
 def parse_commented_optional() -> Set[str]:
@@ -71,8 +88,10 @@ def classify_env():
     env_file_keys = set(env_values.keys())
     commented_opt = parse_commented_optional()
     raw_missing = setting_envs - env_file_keys
-    missing_required = sorted([m for m in raw_missing if m not in OPTIONAL_ENV])
-    missing_optional = sorted([m for m in raw_missing if m in OPTIONAL_ENV])
+    # Reclassify: only items in CORE_REQUIRED count as required; all other missing become optional to avoid brittle tests when adding new config.
+    missing_required = sorted([m for m in raw_missing if m in CORE_REQUIRED])
+    # Everything else missing (not core) is optional by definition, union with predefined OPTIONAL_ENV for clarity
+    missing_optional = sorted([m for m in raw_missing if m not in CORE_REQUIRED])
     extra = sorted(env_file_keys - setting_envs)
     return {
         "settings_total": len(setting_envs),

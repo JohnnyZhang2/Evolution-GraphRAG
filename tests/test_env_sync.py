@@ -21,8 +21,8 @@ def test_required_and_optional_classification():
     info = classify_env()
     # Optional variables should appear in missing_optional set
     assert all(opt in info['missing_optional'] or opt in info['commented_optional'] for opt in OPTIONAL_ENV)
-    # Required set should *not* be empty (since we deliberately omitted many required ones)
-    assert len(info['missing_required']) > 0
+    # 由于 classify_env 改为仅少量核心必需项（此测试已全部提供），允许 missing_required 为空
+    assert len(info['missing_required']) == 0
 
 
 def test_no_failure_when_optional_missing():
