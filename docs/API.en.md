@@ -2,6 +2,10 @@
 
 > Version: `api_version` is exposed via `/health` and `/diagnostics`.
 
+## Architecture Overview (Quick)
+
+End‑to‑end: Hybrid retrieval + subgraph expansion (≤2 hops with quotas/reserve) + path‑level scoring + optional rerank; `/query` accepts external `context` and conversational `history`. External contexts show up in `sources` (reason=external) and can be cited with `[S#]`.
+
 ## Overview
 
 Evolution RAG is a local, explainable Graph-augmented Retrieval QA system built on FastAPI + Neo4j. This document describes REST endpoints, request/response payloads, scoring interpretation, and troubleshooting notes.
@@ -215,14 +219,22 @@ Request Body:
 ```jsonc
 {
   "question": "Describe the multi-step approval flow.",
-  "stream": false
+  "stream": false,
+  "context": [
+    {"id":"ext1","text":"An external memo about subgraph depth quotas and path scoring."},
+    "A plain text snippet can also be used as extra context."
+  ],
+  "history": [
+    {"role":"user","content":"Do you support hybrid retrieval?"},
+    {"role":"assistant","content":"Yes: vector + entities + co-occur + llm-rel (+BM25/+degree)."}
+  ]
 }
 ```
 
 Behavior:
 
 - `stream=true`: Server-Sent text chunks (plain text) + final sources list
-- `stream=false`: JSON structure including answer, sources, references, entities, warnings
+- `stream=false`: JSON structure including answer, sources (includes external items with `reason=external`), references, entities, warnings
 
 Non-stream JSON Response example:
 

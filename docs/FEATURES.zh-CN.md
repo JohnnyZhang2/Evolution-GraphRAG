@@ -41,6 +41,9 @@
 - 高可调：所有权重、窗口、扩展跳数、缓存大小、索引名、特性开关均可热配置（改 env + 重启）。
 - 易观测：`/diagnostics` + dump + env diff + 依赖导入检测脚本 + ranking 预览。
 - 增量友好：Chunk 内容哈希跳过未变；关系刷新 CLI；实体再规范化工具。
+ - 上下文增强：/query 支持外部补充上下文（context）与会话历史（history），外部上下文参与 sources 并可被 [S#] 引用。
+ - 图增强与可解释：子图扩展（≤2 跳）+ 深度配额/预留 + 关系一跳配额 + 多关系加权/密度抑制 + 路径级评分（按关系置信与深度衰减）。
+ - 自适应策略（可选）：按问句类型自动调整 TOP_K / 扩展与加权（relation/cause/definition/list 等）。
 
 ### 流程图 (Mermaid)
 
@@ -60,13 +63,14 @@ flowchart TD
 
   subgraph Query
     Q1[用户问题] --> Q2[向量化(缓存)] --> Q3[向量检索 TOP_K]
+    Q1H((会话历史/外部上下文)) --> Q9
     Q3 --> Q4{EXPAND_HOPS=2?}
     Q4 -- 否 --> Q6[合并候选]
-    Q4 -- 是 --> Q5[实体/关系/共现扩展]
+    Q4 -- 是 --> Q5[子图扩展: 实体/关系/共现\n(配额/预留/深度衰减)]
     Q5 --> Q6[合并候选]
-    Q6 --> Q7[Hybrid Scoring]
-    Q7 --> Q8[TopN]
-    Q8 --> Q9[上下文拼接带 S#]
+    Q6 --> Q7[Hybrid + Path Scoring\n(+BM25/+中心性)]
+    Q7 --> Q8[TopN (+Rerank?)]
+    Q8 --> Q9[上下文拼接(含外部 S#)]
     Q9 --> Q10[LLM 回答]
     Q10 --> Q11[引用后处理]
     Q11 --> Q12[返回 JSON / 流式]
@@ -83,9 +87,20 @@ flowchart TD
     -> (Pairwise LLM) -> :REL(type,confidence,evidence)
 
 Query: Question -> normalize synonyms -> embed(cache)
-   -> vector retrieve -> (optional expand by entities/relations)
-   -> hybrid score (vector + bm25 + graph rank + relation bonuses)
-   -> context -> LLM -> answer + references + warnings
+  -> vector retrieve -> (optional expand by entities/relations)
+  -> hybrid + path score (vector + bm25 + graph rank + relation bonuses + path)
+  -> merge external contexts -> context -> LLM -> answer + references + warnings
+
+### 2025-09 架构更新要点
+
+- 新增外部上下文与会话历史注入：/query 接口新增 `context`（字符串或 `{id,text}`）与 `history`（`{role,content}`）字段；外部上下文进入 sources（`reason=external`）并可在回答中通过 [S#] 被引用。
+- 子图扩展稳定性增强：
+  - 深度配额：`SUBGRAPH_DEPTH1_CAP` 限制一跳新增量；`SUBGRAPH_DEEP_RESERVE_NODES` 为更深层预留配额。
+  - 关系一跳配额：`SUBGRAPH_DEPTH1_REL_CAP` 保证关系型节点不被一跳实体吃满。
+  - 多关系加权与密度抑制：`SUBGRAPH_REL_MULTI_SCALE`、`SUBGRAPH_REL_HITS_DECAY`、`SUBGRAPH_REL_DENSITY_*` 抑制长尾与过密关系。
+  - 路径级评分：`SUBGRAPH_PATH_SCORE_ENABLE` 结合 `REL` 置信度与深度衰减为候选计算 `path_score` 并参与最终 bonus。
+- ID 规范化：`ID_NORMALIZE_ENABLE` 使子图扩展匹配更稳定（去零宽/折叠空格等）。
+- 自适应问句（可选）：`ADAPTIVE_QUERY_STRATEGY=true` 启用后按 query_type 动态改 TOP_K/扩展策略/权重。
 ```
 
 ## 数据模型
@@ -207,15 +222,17 @@ Ingest 内部对关键阶段调用 `record()`：
 
 ## 检索流程
 
+0.（可选）读取会话历史与外部上下文：历史仅影响提示词语境；外部上下文将参与 sources 并可被 [S#] 引用。
 1. 规范化查询（同义词替换，若开启实体标准化）
 2. 嵌入 & 缓存命中检测
-3. 向量初检 TOP_K
-4. 可选扩展 (EXPAND_HOPS=2)：通过实体、`RELATES_TO`、`CO_OCCURS_WITH`、`:REL` 邻接扩展候选集合
+3. 向量初检 TOP_K（可并行准备 BM25 稀疏候选与图中心性特征）
+4. 可选扩展 (EXPAND_HOPS=2)：通过实体、`RELATES_TO`、`CO_OCCURS_WITH`、`:REL` 邻接扩展候选集合；受一跳/关系一跳配额与深层预留约束。
 5. 计算 hybrid 基础分：向量归一 + （可选 BM25）+ （可选 GraphRank）
-6. 应用关系加成：共享实体/共现/LLM 语义类型 × confidence × 对应权重
+6. 路径级评分（若启用）：按实体/关系路径与深度衰减汇总 `path_score`，并以 `SUBGRAPH_PATH_SCORE_WEIGHT` 融入最终得分。
 7. 占位 rerank（若启用，当前不改变顺序，仅计分）
-8. 截断 TopN -> 组装含 [S#] 标签上下文 -> 发送回答
-9. 回答后处理（引用解析 / 未用来源 / 未引用数字）
+8. 裁剪与配额：`CONTEXT_MAX`、`CONTEXT_MIN_PER_REASON`、`CONTEXT_PRUNE_*` 控制上下文规模与来源均衡。
+9. 截断 TopN -> 合并外部上下文 -> 组装含 [S#] 标签上下文 -> 发送回答
+10. 回答后处理（引用解析 / 未用来源 / 未引用数字）
 
 ## 排序与权重策略
 
@@ -319,7 +336,7 @@ Fallback STEP_NEXT：使用 `REL_FALLBACK_CONFIDENCE * REL_WEIGHT_STEP_NEXT`。
 | ENTITY_TYPES | Person,Organization,Location,Product,Concept,Event | 允许实体类型集合（逗号/分号/中文逗号分隔）|
 | RELATION_ENFORCE_TYPES | false | 启用后 :REL 仅保留白名单类型 |
 | RELATION_TYPES | STEP_NEXT,CAUSES,SUPPORTS,REFERENCES,PART_OF,SUBSTEP_OF,CONTRASTS | 允许的语义关系类型 |
-| RELATION_FALLBACK_TYPE | STEP_NEXT | 强制模式下未知类型替换；为空=直接丢弃 |
+| RELATION_FALLBACK_TYPE | REFERENCES | 强制模式下未知类型替换；为空=直接丢弃 |
 
 脚注：
 
@@ -375,6 +392,22 @@ MATCH (e:Entity) REMOVE e.type;
   "warnings": [ {"type":"unused_sources","detail":"..."} ]
 }
 ```
+
+注：当传入外部上下文（/query.context）时，这些条目会以 `reason=external` 出现在 `sources` 中，也会参与引用标注 `[S#]` 与 `references` 映射。
+
+## 上下文与会话支持
+
+为提高问答的可控性与可解释性，系统允许在 `/query` 请求中提供：
+
+- context：外部补充上下文，元素可为字符串或对象 `{id,text}`。这些文本在提示词中以独立来源参与生成，并纳入 `sources` 可被 `[S#]` 引用。
+- history：会话历史，元素 `{role,content}`，按顺序加入提示词，有助于连续追问与指代澄清（不会直接参与检索打分）。
+
+示例见 `docs/API.zh-CN.md` 的 /query 请求样例。
+
+## 调试与深度观测（可选）
+
+- 可通过内部调试输出查看“按子图深度聚合”的指标，例如：每层的候选数量与平均 `path_score`，用于评估一跳/二跳的贡献差异与衰减策略是否合理。
+- 结合 `/ranking/preview` 可分析 base_norm 与 bonus（关系加成/路径加成/BM25/中心性）的比例，辅助权重调参。
 
 ## 诊断扩展字段
 

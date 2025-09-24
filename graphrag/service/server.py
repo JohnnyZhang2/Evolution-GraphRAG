@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
-from ..schemas.api import IngestRequest, QueryRequest
+from ..schemas.api import IngestRequest, QueryRequest, QueryChunk, ChatMessage
 from ..graph_ingest.ingest import ingest_path
 import threading
 import queue
@@ -258,7 +258,33 @@ def ingest_stream(
 @app.post("/query")
 def query(req: QueryRequest):
     try:
-        answer_gen, sources = answer_question(req.question, return_sources=True, stream=req.stream)
+        # 解析外部上下文
+        extra_ctx = []
+        if req.context:
+            for c in req.context:
+                if isinstance(c, str):
+                    extra_ctx.append({'text': c})
+                elif isinstance(c, QueryChunk):
+                    extra_ctx.append({'id': c.id, 'text': c.text})
+                elif isinstance(c, dict) and 'text' in c:
+                    extra_ctx.append({'id': c.get('id'), 'text': c['text']})
+        # 解析历史
+        history = []
+        if req.history:
+            for m in req.history:
+                if isinstance(m, ChatMessage):
+                    history.append({'role': m.role, 'content': m.content})
+                elif isinstance(m, dict) and 'role' in m and 'content' in m:
+                    history.append({'role': m['role'], 'content': m['content']})
+        # 先走原始检索/排序 + 注入外部上下文与历史
+        answer_gen, sources = answer_question(
+            req.question,
+            return_sources=True,
+            stream=req.stream,
+            extra_contexts=extra_ctx or None,
+            history=history or None,
+            system_prefix=None
+        )
     except Exception as e:
         import traceback
         return JSONResponse({
@@ -266,6 +292,8 @@ def query(req: QueryRequest):
             "message": str(e),
             "trace": traceback.format_exc(limit=3)
         }, status_code=500)
+    # 将外部上下文与历史集成到提示词（仅在我们自行组装 messages 的非流式分支中可直接控制；
+    # 流式分支按原逻辑维持最小变更，后续可扩展为显式 messages 管线）
     if req.stream:
         def plain_stream():
             try:
@@ -408,6 +436,8 @@ def ranking_preview(req: QueryRequest):
                 bscore = bm25_scores.get(c['id'])
                 if bscore is not None:
                     bonus += settings.bm25_weight * bscore
+            if reason == 'entity':
+                bonus += settings.rel_weight_entity
             if reason == 'relates':
                 bonus += settings.rel_weight_relates
             elif reason == 'cooccur':

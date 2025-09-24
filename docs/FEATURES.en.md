@@ -44,6 +44,9 @@ Design goals:
 - Highly tunable: almost every parameter exposed as environment variables (weights, windows, expansion hops, cache sizes, feature flags).
 - Observable: diagnostics endpoint + dump utilities + env diff + requirement import checker.
 - Incremental friendly: content hashing skips unchanged chunks; standalone relation refresh & entity re‑normalization utilities.
+ - Context & history: `/query` accepts external contexts and a conversation history; external contexts appear in sources and can be cited with [S#].
+ - Graph explainability: subgraph expansion (≤2 hops) with depth quotas/reserve, 1‑hop relation quota, multi‑relation weighting/density suppression, and path‑level scoring (confidence × depth decay).
+ - Adaptive strategy (optional): auto‑tune TOP_K / expansion / weights based on query type.
 
 ### Mermaid Flow
 
@@ -63,13 +66,14 @@ flowchart TD
 
   subgraph Query
     Q1[User Question] --> Q2[Embed (cache)] --> Q3[Vector TOP_K]
+    Q1H((History / External)) --> Q9
     Q3 --> Q4{EXPAND_HOPS=2?}
     Q4 -- No --> Q6[Merge Candidates]
-    Q4 -- Yes --> Q5[Expand via Entities/Relations]
+    Q4 -- Yes --> Q5[Subgraph Expansion: Entities/Relations/Co-occur\\n(quotas/reserve/depth decay)]
     Q5 --> Q6[Merge]
-    Q6 --> Q7[Hybrid Scoring]
-    Q7 --> Q8[TopN]
-    Q8 --> Q9[Context w/ S#]
+    Q6 --> Q7[Hybrid + Path Scoring\\n(+BM25/+Centrality)]
+    Q7 --> Q8[TopN (+Rerank?)]
+    Q8 --> Q9[Context Assembly (with external S#)]
     Q9 --> Q10[LLM Answer]
     Q10 --> Q11[Citation Postproc]
     Q11 --> Q12[Return JSON / Stream]
@@ -86,9 +90,9 @@ flowchart TD
     -> (Pairwise LLM) -> :REL(type,confidence,evidence)
 
 Query: Question -> normalize synonyms -> embed(cache)
-   -> vector retrieve -> (optional expand by entities/relations)
-   -> hybrid score (vector + bm25 + graph rank + relation bonuses)
-   -> context -> LLM -> answer + references + warnings
+  -> vector retrieve -> (optional expand by entities/relations)
+  -> hybrid + path score (vector + bm25 + graph rank + relation bonuses + path)
+  -> merge external contexts -> context -> LLM -> answer + references + warnings
 ```
 
 ## Data Model
@@ -223,16 +227,18 @@ See `.env.example` for the authoritative list.
 
 ## Query Flow
 
+0. (Optional) Read conversation history & external contexts.
 1. Normalize query (synonyms if entity normalization active).
 2. Embed (embedding cache lookup first).
 3. Vector retrieval for initial `TOP_K` chunks.
-4. Optional expansion (`EXPAND_HOPS=2`) using entities, `RELATES_TO`, `CO_OCCURS_WITH`, and `:REL` neighbors.
+4. Optional expansion (`EXPAND_HOPS=2`) using entities, `RELATES_TO`, `CO_OCCURS_WITH`, and `:REL` neighbors; subject to 1‑hop quotas and deep reserve.
 5. Hybrid base score: normalized vector + optional BM25 + optional Graph Rank.
-6. Apply relation bonuses: shared entity / co‑occurrence / each semantic relation type \* confidence \* weight.
-7. (Placeholder) rerank stage if enabled (does not yet reorder significantly).
-8. Truncate to TopN context -> tag with `[S#]` markers.
-9. LLM answer generation.
-10. Post‑processing: citation extraction, unused source warnings, unreferenced numeric detection.
+6. Path‑level scoring (if enabled): aggregate per‑path contributions (confidence × depth decay) into `path_score`, then scale via `SUBGRAPH_PATH_SCORE_WEIGHT`.
+7. (Placeholder) rerank stage if enabled.
+8. Pruning & quotas: `CONTEXT_MAX`, `CONTEXT_MIN_PER_REASON`, `CONTEXT_PRUNE_*`.
+9. Truncate to TopN -> merge external contexts -> assemble with `[S#]` markers.
+10. LLM answer generation.
+11. Post‑processing: citation extraction, unused source warnings, unreferenced numeric detection.
 
 ## Scoring & Weights
 
@@ -392,6 +398,22 @@ Debug tip: `RELATION_LLM_TEMPERATURE=0` reduces label variance during curation.
   "warnings": [...]
 }
 ```
+
+Note: when external contexts (`/query.context`) are provided, they appear in `sources` with `reason=external` and can be cited via `[S#]` and mapped in `references`.
+
+## Context & Conversation Support
+
+`/query` accepts:
+
+- `context`: external supplemental texts (string or `{id,text}`) included in the prompt and eligible for citations.
+- `history`: ordered `{role,content}` messages appended to the prompt; does not directly change retrieval scoring.
+
+See `docs/API.en.md` for examples.
+
+## Debugging & Depth Observability (optional)
+
+- Internal debug output can aggregate by subgraph depth (count and average `path_score`) to compare 1‑hop vs 2‑hop contributions.
+- Use `/ranking/preview` to analyze base_norm vs bonus proportions (relation/path/BM25/degree) and tune weights accordingly.
 
 ## Diagnostics Extensions
 

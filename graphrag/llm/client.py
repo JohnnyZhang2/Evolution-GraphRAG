@@ -105,19 +105,23 @@ def extract_entities(text: str, language: str = "auto") -> List[Union[str, Dict]
             ents = data.get("entities", [])
             if isinstance(ents, list):
                 if settings.entity_typed_mode:
-                    norm: Dict[str, Dict] = {}
-                    for e in ents:
-                        if not isinstance(e, dict):
-                            continue
-                        name = (e.get("name") or "").strip()
-                        etype = (e.get("type") or "").strip()
-                        if not name or not etype:
-                            continue
-                        if etype not in etypes:
-                            continue
-                        # 首次为准
-                        norm.setdefault(name, {"name": name, "type": etype})
-                    collected = list(norm.values())
+                    # 兼容：若返回的是简单字符串列表，也接受并转换为 [{name,type:"UNKNOWN"}] 再在后续可以过滤或用户重跑
+                    if all(isinstance(e, str) for e in ents):
+                        uniq_names = [u for u in {e.strip(): None for e in ents if isinstance(e, str) and e.strip()}]
+                        collected = [{"name": n, "type": "UNKNOWN"} for n in uniq_names]
+                    else:
+                        norm: Dict[str, Dict] = {}
+                        for e in ents:
+                            if not isinstance(e, dict):
+                                continue
+                            name = (e.get("name") or "").strip()
+                            etype = (e.get("type") or "").strip()
+                            if not name or not etype:
+                                continue
+                            if etype not in etypes:
+                                continue
+                            norm.setdefault(name, {"name": name, "type": etype})
+                        collected = list(norm.values())
                 else:
                     uniq = list({( (e.strip() if isinstance(e, str) else "") ): None for e in ents if isinstance(e, str) and e.strip()})
                     collected = [u for u in uniq if u]

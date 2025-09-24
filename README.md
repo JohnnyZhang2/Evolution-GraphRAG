@@ -20,10 +20,42 @@
 
 ```text
 Ingest: 文件 -> 切分 -> 嵌入(hash skip) -> 实体抽取/标准化 -> 共享实体/共现 -> LLM Pairwise 语义关系
-Query : 问题(同义规范化) -> 嵌入缓存 -> 向量初检 -> (可选图扩展) -> Hybrid 评分 -> 上下文拼接 -> 回答 + 引用
+Query : 问题(同义规范化) -> 嵌入缓存 -> 向量初检 -> (可选子图扩展: 配额/预留/衰减) -> Hybrid+Path 评分(+BM25/+中心性) -> 合并外部上下文 -> 回答 + 引用
 ```
 
 更完整的 Mermaid 图、数据模型、关系属性与调参细节请参见 `docs/FEATURES.zh-CN.md`。
+
+```mermaid
+flowchart TD
+  subgraph Ingest
+    A[读取文件] --> B[切分 Chunk]
+    B --> C[向量化 Embedding]
+    C --> D[写入 Chunk 节点]
+    D --> E{实体抽取?}
+    E -- 否 --> G[关系构建(跳过实体关系)]
+    E -- 是 --> F[LLM 实体抽取 -> Entity/HAS_ENTITY]
+    F --> G[构建 RELATES_TO / CO_OCCURS_WITH]
+    G --> H[Pairwise LLM 语义关系 :REL]
+    H --> I[完成 / 可增量或刷新]
+  end
+
+  subgraph Query
+    Q1[用户问题] --> Q2[向量化(缓存)] --> Q3[向量检索 TOP_K]
+    Q1H((会话历史/外部上下文)) --> Q9
+    Q3 --> Q4{EXPAND_HOPS=2?}
+    Q4 -- 否 --> Q6[合并候选]
+    Q4 -- 是 --> Q5[子图扩展: 实体/关系/共现\n(配额/预留/深度衰减)]
+    Q5 --> Q6[合并候选]
+    Q6 --> Q7[Hybrid + Path Scoring\n(+BM25/+中心性)]
+    Q7 --> Q8[TopN (+Rerank?)]
+    Q8 --> Q9[上下文拼接(含外部 S#)]
+    Q9 --> Q10[LLM 回答]
+    Q10 --> Q11[引用后处理]
+    Q11 --> Q12[返回 JSON / 流式]
+  end
+
+  I --> Q3
+```
 
 ## ⚙️ 快速开始
 
@@ -57,6 +89,25 @@ curl -X POST http://localhost:8000/query \
   -d '{"question":"介绍系统架构"}'
 ```
 
+带外部上下文与会话历史：
+
+```bash
+curl -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "question":"介绍系统架构（结合下面额外背景）",
+    "stream": false,
+    "context": [
+      {"id":"ext1","text":"我们的系统新增了关系一跳配额 SUBGRAPH_DEPTH1_REL_CAP，用于确保二跳产出。"},
+      "也可以直接给一段纯文本作为补充上下文"
+    ],
+    "history": [
+      {"role":"user","content":"系统是否支持混合检索？"},
+      {"role":"assistant","content":"支持：向量+共享实体+共现+语义关系(+BM25/+中心性)。"}
+    ]
+  }'
+```
+
 ## ⚡ 快速配置 (.env)
 
 你可以使用已提供的示例文件 `/.env.example` 进行最小成本启动：
@@ -79,7 +130,7 @@ cp .env.example .env
 |----------|----------|------|
 | 启用实体类型写入 | `ENTITY_TYPED_MODE=true` + 配置 `ENTITY_TYPES` | 限制图中实体类型，提升一致性 |
 | 语义关系白名单 | `RELATION_ENFORCE_TYPES=true` + 配置 `RELATION_TYPES` | 噪声高时收敛关系集合 |
-| 回退统一类型 | `RELATION_FALLBACK_TYPE=STEP_NEXT` | 将不在白名单的保留为常规顺序关系 |
+| 回退统一类型 | `RELATION_FALLBACK_TYPE=REFERENCES` | 将不在白名单的保留为引用型关系 |
 | 启用 BM25 | `BM25_ENABLED=true` | 首次查询会 lazy 构建倒排索引 |
 | 图中心性加成 | `GRAPH_RANK_ENABLED=true` | 根据度中心性在混排阶段加分 |
 | Hash 增量处理 | `HASH_INCREMENTAL_ENABLED=true` | 重新 ingest 时跳过未变 chunk |
@@ -139,13 +190,13 @@ curl -X POST http://localhost:8000/query \
 | `ENTITY_TYPES` | Person,Organization,Location,Product,Concept,Event | 允许实体类型列表（逗号/分号/中文逗号分隔，忽略空格大小写）|
 | `RELATION_ENFORCE_TYPES` | false | true 时语义关系只保留白名单 |
 | `RELATION_TYPES` | STEP_NEXT,CAUSES,SUPPORTS,REFERENCES,PART_OF,SUBSTEP_OF,CONTRASTS | 允许的语义关系类型 |
-| `RELATION_FALLBACK_TYPE` | STEP_NEXT | 强制模式下不在白名单的类型替换为该值；为空则直接丢弃 |
+| `RELATION_FALLBACK_TYPE` | REFERENCES | 强制模式下不在白名单的类型替换为该值；为空则直接丢弃 |
 
 推荐启用顺序：
 
 1. `ENTITY_TYPED_MODE=true` 并配置 `ENTITY_TYPES`
 2. （可选）`RELATION_ENFORCE_TYPES=true` + 精简 `RELATION_TYPES`
-3. （可选）设 `RELATION_FALLBACK_TYPE=STEP_NEXT` 保留降级信息
+3. （可选）设 `RELATION_FALLBACK_TYPE=REFERENCES` 保留降级信息
 4. 全量或 `refresh=true` 重跑以补写历史 `Entity.type`
 5. 后续增量遵循 hash skip，不重复计算已稳定 chunk
 
@@ -163,7 +214,7 @@ ENTITY_TYPED_MODE=true
 ENTITY_TYPES=Person,Organization,Event
 RELATION_ENFORCE_TYPES=true
 RELATION_TYPES=CAUSES,SUPPORTS,PART_OF,SUBSTEP_OF,STEP_NEXT
-RELATION_FALLBACK_TYPE=STEP_NEXT
+RELATION_FALLBACK_TYPE=REFERENCES
 ```
 
 诊断查看：`/diagnostics` -> `feature_flags.entity_typed_mode` / `relation_enforce_types`。

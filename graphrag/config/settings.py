@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     # 非 LLM 关系加成
     rel_weight_relates: float = Field(0.15, alias="REL_WEIGHT_RELATES")
     rel_weight_cooccur: float = Field(0.10, alias="REL_WEIGHT_COOCCUR")
+    # 实体扩展 (HAS_ENTITY 反向找其他含该实体 chunk) 额外加成
+    rel_weight_entity: float = Field(0.12, alias="REL_WEIGHT_ENTITY")
     # 缓存与索引
     embed_cache_max: int = Field(128, alias="EMBED_CACHE_MAX")
     answer_cache_max: int = Field(64, alias="ANSWER_CACHE_MAX")
@@ -68,6 +70,15 @@ class Settings(BaseSettings):
     # ---- Rerank (post-score) ----
     rerank_enabled: bool = Field(False, alias="RERANK_ENABLED")
     rerank_alpha: float = Field(0.5, alias="RERANK_ALPHA")  # final = alpha * composite + (1-alpha) * rerank
+    # 可选：远程或本地 cross-encoder rerank 服务配置（留空则使用 embedding 余弦近似降级方案）
+    rerank_model: str = Field("", alias="RERANK_MODEL")  # 例如: bge-reranker-large
+    rerank_endpoint: str = Field("", alias="RERANK_ENDPOINT")  # HTTP POST 接口地址
+    rerank_top_n: int = Field(60, alias="RERANK_TOP_N")  # 送入 rerank 的最大候选数
+    rerank_timeout: int = Field(15, alias="RERANK_TIMEOUT")  # 秒
+    # rerank 远程调用熔断 & 缓存
+    rerank_cb_fails: int = Field(3, alias="RERANK_CB_FAILS")  # 连续失败阈值
+    rerank_cb_cooldown: int = Field(60, alias="RERANK_CB_COOLDOWN")  # 熔断后冷却秒数
+    rerank_cache_ttl: int = Field(120, alias="RERANK_CACHE_TTL")  # 结果缓存 TTL 秒
 
     # ---- BM25 / Hybrid ----
     bm25_enabled: bool = Field(False, alias="BM25_ENABLED")
@@ -85,6 +96,16 @@ class Settings(BaseSettings):
     # ---- 图中心性加成 (Degree) ----
     graph_rank_enabled: bool = Field(False, alias="GRAPH_RANK_ENABLED")
     graph_rank_weight: float = Field(0.1, alias="GRAPH_RANK_WEIGHT")
+
+    # ---- 上下文裁剪 (Context Pruning) ----
+    # 最大传给 LLM 的上下文条数（最终）
+    context_max: int = Field(24, alias="CONTEXT_MAX")
+    # 各来源最少保留（防止单一来源垄断）: vector / entity / relates / cooccur / llm_rel
+    context_min_per_reason: int = Field(2, alias="CONTEXT_MIN_PER_REASON")
+    # 若初步集合 > context_max * prune_ratio 时启动二级裁剪（基于得分差距）
+    context_prune_ratio: float = Field(1.6, alias="CONTEXT_PRUNE_RATIO")
+    # 分数差距阈值：低于( top_score - gap ) 的尾部候选倾向剔除
+    context_prune_gap: float = Field(0.55, alias="CONTEXT_PRUNE_GAP")
 
     # ---- 噪声控制（实体与共现） ----
     entity_min_length: int = Field(2, alias="ENTITY_MIN_LENGTH")  # 小于该长度的实体丢弃
@@ -106,6 +127,67 @@ class Settings(BaseSettings):
     relation_enforce_types: bool = Field(False, alias="RELATION_ENFORCE_TYPES")
     # 过滤后若需要回退的默认类型（为空则直接丢弃非法类型）
     relation_fallback_type: str | None = Field("REFERENCES", alias="RELATION_FALLBACK_TYPE")
+
+    # ---- 自适应 / 图增强能力 (Graph Adaptive Strategy) ----
+    # 是否根据问句类型动态调整 top_k / context_max / 扩展策略
+    adaptive_query_strategy: bool = Field(False, alias="ADAPTIVE_QUERY_STRATEGY")
+    # 启用子图提取（基于初始命中构建局部实体-Chunk 邻域）
+    subgraph_enable: bool = Field(False, alias="SUBGRAPH_ENABLE")
+    # 子图最大扩展 Chunk 数（硬上限，避免大爆炸）
+    subgraph_max_nodes: int = Field(120, alias="SUBGRAPH_MAX_NODES")
+    # 子图最大“逻辑深度”占位（当前简单 1~2 跳，可预留）
+    subgraph_max_depth: int = Field(2, alias="SUBGRAPH_MAX_DEPTH")
+    # 限定扩展关系类型（逗号分隔；'*' 表示全部允许；用于未来启用 LLM 关系时过滤）
+    subgraph_rel_types: str = Field("*", alias="SUBGRAPH_REL_TYPES")
+    # 子图补充块的额外加权（与实体扩展类似）
+    subgraph_weight: float = Field(0.12, alias="SUBGRAPH_WEIGHT")
+    # 每个实体在子图扩展中允许引出的最大 chunk 数（防止热门实体爆炸）
+    subgraph_per_entity_limit: int = Field(4, alias="SUBGRAPH_PER_ENTITY_LIMIT")
+    # 子图深度衰减系数（depth>=2 时 bonus *= 1/(1+decay*(depth-1))）
+    subgraph_depth_decay: float = Field(0.15, alias="SUBGRAPH_DEPTH_DECAY")
+    # 关系型子图节点额外乘数（在基础 weight 上加入与关系权重融合前的一阶缩放）
+    subgraph_rel_multiplier: float = Field(1.0, alias="SUBGRAPH_REL_MULTIPLIER")
+    # 按关系类型细粒度 multiplier（仅对子图 rel 节点生效），格式: "CAUSES:1.3,SUPPORTS:1.1,REFERENCES:0.9"
+    subgraph_rel_type_multipliers: str = Field("", alias="SUBGRAPH_REL_TYPE_MULTIPLIERS")
+    # LLM 关系最低置信度（当启用关系抽取时用于过滤）
+    relation_min_confidence: float = Field(0.4, alias="RELATION_MIN_CONFIDENCE")
+    # 至少保留的子图关系节点数量（避免被实体补全截断）
+    subgraph_rel_min_keep: int = Field(6, alias="SUBGRAPH_REL_MIN_KEEP")
+    # 多关系加权：对 rel_hits 中除代表关系外的其他关系的累积加成缩放系数
+    subgraph_rel_multi_scale: float = Field(0.35, alias="SUBGRAPH_REL_MULTI_SCALE")
+    # 多关系加权的衰减（按置信度排序后第 i 条乘以 decay^i）
+    subgraph_rel_hits_decay: float = Field(0.7, alias="SUBGRAPH_REL_HITS_DECAY")
+    # 参与多关系加权的最大关系条数（防止长尾爆炸）
+    subgraph_rel_hits_max: int = Field(5, alias="SUBGRAPH_REL_HITS_MAX")
+    # 关系密度抑制：超过该条数开始惩罚
+    subgraph_rel_density_cap: int = Field(6, alias="SUBGRAPH_REL_DENSITY_CAP")
+    # 关系密度惩罚强度 (penalty_factor = 1/(1+alpha*(len-rel_density_cap)))
+    subgraph_rel_density_alpha: float = Field(0.15, alias="SUBGRAPH_REL_DENSITY_ALPHA")
+
+    # --- 深度控制增强 ---
+    # depth=1 时最多允许新增的节点数（0 或负数表示不单独限定，按整体上限）
+    subgraph_depth1_cap: int = Field(0, alias="SUBGRAPH_DEPTH1_CAP")
+    # depth=1 时关系扩展（通过 REL 边新增的 chunk）最大新增数量；0 表示不单独限制
+    subgraph_depth1_rel_cap: int = Field(0, alias="SUBGRAPH_DEPTH1_REL_CAP")
+    # 为更深层(depth>=2)预留的节点配额，避免第一层耗尽全部容量
+    subgraph_deep_reserve_nodes: int = Field(20, alias="SUBGRAPH_DEEP_RESERVE_NODES")
+    # ---- 子图路径级评分 (Path Scoring) ----
+    # 是否启用路径级额外评分 (对 subgraph/subgraph_rel 节点计算 path_score)
+    subgraph_path_score_enable: bool = Field(True, alias="SUBGRAPH_PATH_SCORE_ENABLE")
+    # 实体共享路径基础值 (经由实体共现引出的路径贡献基数)
+    subgraph_path_entity_base: float = Field(0.5, alias="SUBGRAPH_PATH_ENTITY_BASE")
+    # 关系路径按置信度乘的权重系数 (conf * weight)
+    subgraph_path_rel_conf_weight: float = Field(0.6, alias="SUBGRAPH_PATH_REL_CONF_WEIGHT")
+    # 实体路径深度衰减 (depth>=2: contrib *= entity_decay^(depth-1))
+    subgraph_path_entity_decay: float = Field(0.65, alias="SUBGRAPH_PATH_ENTITY_DECAY")
+    # 关系路径深度衰减
+    subgraph_path_rel_decay: float = Field(0.7, alias="SUBGRAPH_PATH_REL_DECAY")
+    # 汇总的 path_score 参与最终 bonus 的缩放系数
+    subgraph_path_score_weight: float = Field(0.32, alias="SUBGRAPH_PATH_SCORE_WEIGHT")
+    # 每个节点保留的最大路径条目记录(调试展示)
+    subgraph_path_max_records: int = Field(8, alias="SUBGRAPH_PATH_MAX_RECORDS")
+    # ID 规范化开关 (strip/去零宽/折叠空格) 用于子图扩展匹配稳定
+    id_normalize_enable: bool = Field(True, alias="ID_NORMALIZE_ENABLE")
 
 
 @lru_cache()

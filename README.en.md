@@ -99,13 +99,13 @@ Variables (defaults defined in `settings.py`):
 | `ENTITY_TYPES` | Person,Organization,Location,Product,Concept,Event | Allowed entity types (comma / semicolon; whitespace ignored) |
 | `RELATION_ENFORCE_TYPES` | false | If true, keep only whitelisted semantic relations |
 | `RELATION_TYPES` | STEP_NEXT,CAUSES,SUPPORTS,REFERENCES,PART_OF,SUBSTEP_OF,CONTRASTS | Allowed relation type set |
-| `RELATION_FALLBACK_TYPE` | STEP_NEXT | Replacement for non-whitelisted types (blank => drop) |
+| `RELATION_FALLBACK_TYPE` | REFERENCES | Replacement for non-whitelisted types (blank => drop) |
 
 Recommended sequence:
 
 1. Enable `ENTITY_TYPED_MODE` + set `ENTITY_TYPES`
 2. (Optional) Enable `RELATION_ENFORCE_TYPES` with tuned `RELATION_TYPES`
-3. (Optional) Add `RELATION_FALLBACK_TYPE=STEP_NEXT`
+3. (Optional) Add `RELATION_FALLBACK_TYPE=REFERENCES`
 4. Run full ingest or `refresh=true` to backfill `Entity.type`
 5. Incremental runs skip unchanged chunks (hash)
 
@@ -123,7 +123,7 @@ ENTITY_TYPED_MODE=true
 ENTITY_TYPES=Person,Organization,Event
 RELATION_ENFORCE_TYPES=true
 RELATION_TYPES=CAUSES,SUPPORTS,PART_OF,SUBSTEP_OF,STEP_NEXT
-RELATION_FALLBACK_TYPE=STEP_NEXT
+RELATION_FALLBACK_TYPE=REFERENCES
 ```
 
 Diagnostics: `/diagnostics` -> `feature_flags`.

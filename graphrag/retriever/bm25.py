@@ -40,9 +40,39 @@ class BM25Index:
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
-        # 极简分词：按非字母数字切分，小写
+        """改进中文支持：
+        优先使用 jieba 分词；若未安装，回退：
+          1. 正则切出英文/数字/汉字串
+          2. 对纯中文长串再生成 2-gram （提升 recall）
+        """
         import re
-        return [w.lower() for w in re.split(r"[^0-9A-Za-z_\u4e00-\u9fa5]+", text) if w]
+        text = text.strip()
+        if not text:
+            return []
+        lowered = text.lower()
+        tokens: List[str] = []
+        try:
+            import jieba  # type: ignore
+            for seg in jieba.cut(lowered):
+                seg = seg.strip()
+                if not seg:
+                    continue
+                if re.fullmatch(r"[0-9a-zA-Z_]+", seg):
+                    tokens.append(seg)
+                else:
+                    # 中文片段：保留原词 + 可选再切字 bigram 提升模糊匹配
+                    tokens.append(seg)
+                    if len(seg) >= 4:  # 避免太短浪费
+                        tokens.extend([seg[i:i+2] for i in range(len(seg)-1)])
+            return tokens
+        except Exception:
+            # fallback old logic + 中文 bigram
+            rough = [w for w in re.split(r"[^0-9A-Za-z_\u4e00-\u9fa5]+", lowered) if w]
+            for w in rough:
+                tokens.append(w)
+                if re.search(r"[\u4e00-\u9fa5]", w) and len(w) >= 4:
+                    tokens.extend([w[i:i+2] for i in range(len(w)-1)])
+            return tokens
 
     def score(self, query: str, top_k: int = 20) -> Dict[str, float]:
         if not self._built:

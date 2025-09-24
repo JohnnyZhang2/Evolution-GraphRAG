@@ -5,6 +5,16 @@
 > 基础 URL: `http://localhost:8010`（请按实际启动端口替换）
 > 当前 `api_version` 通过 `/health` 与 `/diagnostics` 返回，例如：`{"status":"ok","api_version":"0.1.0"}`。
 
+## 架构总览（速览）
+
+系统采用“多信号混合检索 + 子图增强 + 路径级评分 + 可选 rerank”的整体流程，并支持在 `/query` 中注入外部上下文（context）与会话历史（history），外部上下文会出现在 `sources`（reason=external）并可被回答中的 `[S#]` 引用。
+
+高层流程：
+
+1) Ingest：切分 → 嵌入（含哈希跳过）→ 实体抽取/标准化 → 共享实体/共现 → LLM Pairwise 语义关系。
+2) Query：向量初检 →（可选）子图扩展（≤2 跳，含一跳/关系一跳配额与深层预留）→ Hybrid + Path Scoring（向量/BM25/中心性/关系加成/路径加成）→ 上下文拼接（合并外部）→ 生成 → 引用后处理。
+3) 观测/调优：/diagnostics、/ranking/preview、SSE 导入进度、缓存状态。
+
 ## 总览
 
 | 方法 | 路径 | 功能 | 典型用途 |
@@ -31,13 +41,14 @@
 
 返回服务基本可用性与 API 版本。
 
-响应示例：
+错误示例：
 
 ```json
 {"status": "ok", "api_version": "0.1.0"}
 ```
 
 ## 2. 文档导入
+
 
 ### POST /ingest
 
@@ -219,7 +230,15 @@ data: {"stage":"done"}
 ```jsonc
 {
   "question": "介绍系统架构",
-  "stream": false
+  "stream": false,
+  "context": [
+    {"id":"ext1","text":"这里可以放外部补充材料文本（可带 id 便于引用）"},
+    "也可以直接传一段纯文本作为额外上下文"
+  ],
+  "history": [
+    {"role":"user","content":"系统是否支持混合检索？"},
+    {"role":"assistant","content":"支持：向量+共享实体+共现+语义关系(+BM25/+中心性)。"}
+  ]
 }
 ```
 字段说明：
@@ -228,6 +247,8 @@ data: {"stage":"done"}
 |------|------|------|------|------|
 | question | string | 是 | - | 用户问题（会进行同义规范化）|
 | stream | bool | 否 | true | 是否采用流式输出（逐段返回回答文本）|
+| context | array | 否 | - | 外部补充上下文；元素可为字符串或对象 {id,text}；会被编入提示并参与 [S#] 引用（sources 中 reason=external）|
+| history | array | 否 | - | 会话历史，元素形如 {role: system/user/assistant, content: "..."}；按顺序插入提示帮助多轮追问 |
 
 #### 3.1 流式模式
 
@@ -252,12 +273,17 @@ curl -N -X POST http://localhost:8000/query \
  
 #### 3.2 非流式模式
 
-请求示例：
+请求示例（含外部上下文与历史）：
 
 ```bash
 curl -X POST http://localhost:8000/query \
   -H 'Content-Type: application/json' \
-  -d '{"question":"Explain architecture","stream":false}'
+  -d '{
+    "question":"Explain architecture",
+    "stream":false,
+    "context":[{"id":"ext1","text":"an external memo about subgraph depth controls"}],
+    "history":[{"role":"user","content":"Do you support hybrid retrieval?"},{"role":"assistant","content":"Yes: vector+entities+co-occur+llm-rel(+BM25/+degree)."}]
+  }'
 ```
 示例响应：
 
@@ -288,6 +314,7 @@ curl -X POST http://localhost:8000/query \
 |------|------|
 | answer | 生成的回答，内含 `[S#]` 引用标记 |
 | sources | 检索阶段的候选块列表（含排序、得分、关系类型等）|
+| 注 | 当传入外部上下文时，这些条目会出现在 sources 中（reason=external），可在回答里通过 [S#] 被引用 |
 | references | 基于回答中实际出现 `[S#]` 的映射列表（引用后处理结果）|
 | entities | 在已用上下文 chunks 中出现的实体及频次（便于语义解释）|
 | warnings | 未引用来源 / 可能需要引用的数字事实等提示 |
@@ -343,6 +370,7 @@ curl -X POST http://localhost:8000/query \
 ## 5. 缓存状态
 
 ### GET /cache/stats
+
 返回向量嵌入缓存与答案缓存占用情况（截取前若干 key 便于调试）。
 
 响应示例：
@@ -358,6 +386,7 @@ curl -X POST http://localhost:8000/query \
 
 
 ### POST /cache/clear
+
 清空运行期内存缓存。
 
 响应示例：
@@ -369,6 +398,7 @@ curl -X POST http://localhost:8000/query \
 ## 6. 排序打分预览
 
 ### POST /ranking/preview
+
 返回检索 / 扩展阶段的候选块，并给出基础向量归一分、关系加成、BM25 加成、图中心性加成及最终合成得分。不会调用回答 LLM，适合调参。
 
 请求体：
