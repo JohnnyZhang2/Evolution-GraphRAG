@@ -574,14 +574,46 @@ def build_prompt(question: str, contexts: List[Dict], history: Optional[List[Dic
         tag = f"[S{idx}]"
         context_text_lines.append(f"{tag} {c['text']}")
     context_text = '\n\n'.join(context_text_lines)
-    system = (
-        (system_prefix + "\n") if system_prefix else ""
-    ) + (
+    # 可配置系统提示词（优先 use settings.answer_system_prompt）
+    from ..config.settings import get_settings as __gs
+    __st = __gs()
+    # 0) 尝试从 prompts.json 加载激活模板
+    system_core = None
+    try:
+        from ..config.prompt_store import load_prompts as __lp
+        pl = __lp()
+        act = pl.get('active')
+        if act:
+            for t in (pl.get('templates') or []):
+                if isinstance(t, dict) and t.get('name') == act:
+                    v = t.get('content')
+                    if isinstance(v, str) and v.strip():
+                        system_core = v
+                        break
+    except Exception:
+        system_core = None
+    default_system = (
         "你是一个知识图谱增强的智能问答助手。必须仅依据提供的上下文回答，不得编造。"
         "在引用具体事实、数据、时长或文件段落时，紧跟相应引用标记如 [S1]、[S2]。"
         "如果多个来源支持同一事实，可合并如 [S1][S3]。无法回答时明确说明。保持用户语言。"
         "请尽量整合所有相关片段的信息，避免只回答局部；若问题涉及人物/实体之间的关系、身份或属性，请在答案中明确列出并附引用。"
     )
+    # 1) 若有模板集合且设置了当前激活模板，则优先使用模板
+    try:
+        templates_raw = getattr(__st, 'answer_prompt_templates', None)
+        active_key = getattr(__st, 'answer_prompt_active', None)
+        if templates_raw and active_key:
+            import json as _json
+            mp = _json.loads(templates_raw)
+            if isinstance(mp, dict) and active_key in mp and isinstance(mp[active_key], str):
+                system_core = mp[active_key]
+    except Exception:
+        system_core = None
+    # 2) 若未命中模板，则尝试单独的 answer_system_prompt；最后回退默认
+    if not system_core:
+        configured = getattr(__st, 'answer_system_prompt', None)
+        system_core = (configured or default_system)
+    system = ((system_prefix + "\n") if system_prefix else "") + system_core
     user = f"问题: {question}\n\n上下文(含编号):\n{context_text}\n\n请给出结构化回答，并恰当添加引用标记。"
     msgs = [{"role": "system", "content": system}]
     # 合并会话历史（可选）

@@ -19,6 +19,7 @@ from ..config.settings import Settings as SettingsModel
 from ..utils.diagnostics import run_all as run_diagnostics
 from ..retriever.retrieve import build_prompt
 from ..llm.client import extract_relations
+from ..config.prompt_store import load_prompts, save_prompts
 
 settings = get_settings()
 
@@ -524,6 +525,30 @@ def cache_stats():
             "embedding_cache_keys": list(_question_embedding_cache.keys())[:20],
             "answer_cache_keys": list(_answer_cache.keys())[:20]
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ------------------- 提示词模板管理 -------------------
+@app.get('/prompts')
+def get_prompts():
+    try:
+        return load_prompts()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post('/prompts')
+def set_prompts(payload: dict):
+    try:
+        active = payload.get('active')
+        templates = payload.get('templates') or []
+        if not isinstance(templates, list):
+            raise HTTPException(status_code=400, detail='templates 必须是数组')
+        info = save_prompts(active, templates)
+        if not info.get('saved'):
+            raise HTTPException(status_code=500, detail=info.get('error','保存失败'))
+        return info
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -189,6 +189,14 @@ class Settings(BaseSettings):
     # ID 规范化开关 (strip/去零宽/折叠空格) 用于子图扩展匹配稳定
     id_normalize_enable: bool = Field(True, alias="ID_NORMALIZE_ENABLE")
 
+    # ---- 可配置的回答系统提示词 ----
+    # 若为空则使用内置默认提示词；可在前端配置页编辑并选择持久化到 .env
+    answer_system_prompt: str | None = Field(None, alias="ANSWER_SYSTEM_PROMPT")
+    # 多模板支持：JSON 字符串，形如 {"严谨引用":"...","精简要点":"..."}
+    answer_prompt_templates: str | None = Field(None, alias="ANSWER_PROMPT_TEMPLATES")
+    # 当前激活模板的键名
+    answer_prompt_active: str | None = Field(None, alias="ANSWER_PROMPT_ACTIVE")
+
 
 @lru_cache()
 def get_settings() -> Settings:

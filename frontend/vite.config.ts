@@ -17,7 +17,8 @@ export default defineConfig(({ mode }) => {
         '/ranking': api,
         '/docs': api,
         '/config': api,
-        '/qa': api
+        '/qa': api,
+        '/prompts': api
       }
     }
   }

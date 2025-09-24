@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Button, Checkbox, Space, message, Form, Input, InputNumber, Switch, Collapse, Divider, Tooltip, Typography, Select } from 'antd'
+import { Button, Checkbox, Space, message, Form, Input, InputNumber, Switch, Collapse, Divider, Tooltip, Typography, Select, List, Modal } from 'antd'
 import { InfoCircleOutlined } from '@ant-design/icons'
 const { Panel } = Collapse
 const { Text } = Typography
@@ -119,6 +119,7 @@ const SECTIONS: Array<{title:string, fields: FieldMeta[]}> = [
       { key: 'context_min_per_reason', label: '来源最低保留', type: 'number', desc: '每类来源（向量/实体/关系/共现/LLM 关系）最少保留条数', min:0, max:10 },
       { key: 'entity_normalize_enabled', label: '实体标准化', type: 'boolean', desc: '启用同义词合并与规范化' },
       { key: 'synonyms_file', label: '同义词文件', type: 'string', desc: 'JSON 或 TSV 文件路径（alt→canonical）' },
+      { key: 'answer_system_prompt', label: '回答系统提示词', type: 'string', desc: '可选，留空则使用内置默认提示词；可编写风格与引用规范说明' },
     ]
   }
 ]
@@ -129,6 +130,9 @@ export function PageConfig(){
   const [diag, setDiag] = useState<any>(null)
   const [raw, setRaw] = useState<any>({})
   const [loading, setLoading] = useState(false)
+  const [promptTemplates, setPromptTemplates] = useState<Record<string,string>>({})
+  const [promptActive, setPromptActive] = useState<string | undefined>(undefined)
+  const [promptSaving, setPromptSaving] = useState(false)
   const defaultEntityTypes = ['Person','Organization','Location','Product','Concept','Event']
   const defaultRelTypes = ['STEP_NEXT','CAUSES','SUPPORTS','REFERENCES','PART_OF','SUBSTEP_OF','CONTRASTS','FOLLOWS']
 
@@ -138,6 +142,22 @@ export function PageConfig(){
       const r = await fetch(`${API}/config`)
       const j = await r.json();
       setRaw(j)
+      // 模板集合改为从 /prompts 读取
+      try{
+        const rp = await fetch(`${API}/prompts`)
+        if(rp.ok){
+          const pj = await rp.json()
+          const arr = Array.isArray(pj?.templates)? pj.templates : []
+          const map: Record<string,string> = {}
+          for(const t of arr){
+            if(t && typeof t.name==='string') map[t.name] = String(t.content||'')
+          }
+          setPromptTemplates(map)
+          setPromptActive(pj?.active || undefined)
+        } else {
+          setPromptTemplates({}); setPromptActive(undefined)
+        }
+      }catch{ setPromptTemplates({}); setPromptActive(undefined) }
       // 填充表单；password 不回显
       const initial: any = {}
       for(const sec of SECTIONS){
@@ -203,6 +223,84 @@ export function PageConfig(){
         message.error(`保存失败：${e?.message||e}`)
       }
     }
+  }
+
+  async function loadPrompts(){
+    try{
+      const rp = await fetch(`${API}/prompts`)
+      if(!rp.ok){ message.error('读取模板失败'); return }
+      const pj = await rp.json()
+      const arr = Array.isArray(pj?.templates)? pj.templates : []
+      const map: Record<string,string> = {}
+      for(const t of arr){
+        if(t && typeof t.name==='string') map[t.name] = String(t.content||'')
+      }
+      setPromptTemplates(map)
+      setPromptActive(pj?.active || undefined)
+      message.success('已读取模板')
+    }catch(e:any){ message.error(`读取模板失败：${e?.message||e}`) }
+  }
+
+  async function savePrompts(){
+    try{
+      setPromptSaving(true)
+      const list = Object.entries(promptTemplates).map(([name, content])=> ({name, content}))
+      const r = await fetch(`${API}/prompts`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({active: promptActive || null, templates: list})
+      })
+      if(r.ok){
+        const j = await r.json()
+        message.success(`模板已保存（${j.count||list.length} 条）`)
+        // 重新读取一次，确保 active 等被后端规范化
+        loadPrompts()
+      } else {
+        const err = await r.json().catch(()=>({detail:r.statusText}))
+        message.error(`模板保存失败：${err.detail || r.statusText}`)
+      }
+    }catch(e:any){
+      message.error(`模板保存失败：${e?.message||e}`)
+    } finally { setPromptSaving(false) }
+  }
+
+  async function importFromEnv(){
+    try{
+      setPromptSaving(true)
+      // 读取 /config 的旧字段
+      const rc = await fetch(`${API}/config`)
+      if(!rc.ok){ message.error('读取配置失败'); return }
+      const cj = await rc.json()
+      let envMap: Record<string,string> = {}
+      let envActive: string | undefined = undefined
+      try{
+        if(cj?.answer_prompt_templates){
+          const obj = JSON.parse(cj.answer_prompt_templates)
+          if(obj && typeof obj==='object') envMap = obj as Record<string,string>
+        }
+        if(typeof cj?.answer_prompt_active === 'string') envActive = cj.answer_prompt_active
+      }catch{}
+      const names = Object.keys(envMap)
+      if(names.length===0){ message.info('未在 .env 中检测到可导入的模板'); return }
+      // 合并策略：以 .env 模板覆盖同名项
+      const merged: Record<string,string> = {...promptTemplates, ...envMap}
+      const active = envActive || promptActive || null
+      const list = Object.entries(merged).map(([name, content])=> ({name, content}))
+      const r = await fetch(`${API}/prompts`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({active, templates: list})
+      })
+      if(r.ok){
+        const j = await r.json()
+        message.success(`已从 .env 导入并保存（共 ${j.count||list.length} 条）`)
+        // 刷新前端状态
+        await loadPrompts()
+      } else {
+        const err = await r.json().catch(()=>({detail:r.statusText}))
+        message.error(`导入失败：${err.detail || r.statusText}`)
+      }
+    }catch(e:any){
+      message.error(`导入失败：${e?.message||e}`)
+    } finally{ setPromptSaving(false) }
   }
 
   async function test(){
@@ -274,6 +372,8 @@ export function PageConfig(){
                       <Select mode="multiple" placeholder="选择关系类型或 * 全部" allowClear options={[{label:'* (全部)', value:'*'}, ...defaultRelTypes.map(v=>({label:v, value:v}))]} />
                     ) : f.key==='relation_fallback_type' ? (
                       <Select allowClear placeholder="留空则丢弃非法类型" options={defaultRelTypes.map(v=>({label:v, value:v}))} />
+                    ) : f.key==='answer_system_prompt' ? (
+                      <Input.TextArea placeholder="请输入系统提示词（留空使用默认）" autoSize={{minRows:3, maxRows:8}} />
                     ) : (
                       <Input placeholder={`请输入 ${f.label}`} />
                     )
@@ -287,6 +387,85 @@ export function PageConfig(){
           </div>
         ))}
       </Form>
+
+      {/* 提示词模板管理 */}
+      <div style={{border:'1px solid #eee', borderRadius:8, padding:12, marginBottom:12}}>
+        <Divider orientation="left" style={{marginTop:0}}>提示词模板（可选）</Divider>
+        <Space wrap style={{marginBottom:8}}>
+          <Select
+            style={{minWidth:240}}
+            placeholder="选择激活模板"
+            value={promptActive}
+            onChange={v=>setPromptActive(v)}
+            options={Object.keys(promptTemplates).map(k=>({label:k, value:k}))}
+            allowClear
+          />
+          <Button onClick={()=>{
+            Modal.confirm({
+              title:'新增模板',
+              content:(
+                <div>
+                  <Input placeholder='模板名称' id='pt-name' style={{marginBottom:8}} />
+                  <Input.TextArea placeholder='模板内容' id='pt-content' autoSize={{minRows:3,maxRows:8}} />
+                </div>
+              ),
+              onOk:()=>{
+                const name = (document.getElementById('pt-name') as HTMLInputElement)?.value?.trim()
+                const content = (document.getElementById('pt-content') as HTMLTextAreaElement)?.value
+                if(!name){ message.warning('请输入模板名称'); return Promise.reject() }
+                setPromptTemplates(prev=> ({...prev, [name]: content||''}))
+                if(!promptActive) setPromptActive(name)
+              }
+            })
+          }}>新增模板</Button>
+          <Button onClick={loadPrompts}>读取模板</Button>
+          <Button type="primary" onClick={savePrompts} loading={promptSaving}>保存模板</Button>
+          <Button onClick={importFromEnv} loading={promptSaving}>从 .env 导入</Button>
+        </Space>
+        <List
+          bordered
+          dataSource={Object.entries(promptTemplates)}
+          locale={{emptyText:'暂无模板'}}
+          renderItem={([name, content])=> (
+            <List.Item
+              actions={[
+                <a key='edit' onClick={()=>{
+                  Modal.confirm({
+                    title:`编辑模板 - ${name}`,
+                    content:(
+                      <div>
+                        <Input defaultValue={name} disabled style={{marginBottom:8}} />
+                        <Input.TextArea defaultValue={content} id='pt-edit-content' autoSize={{minRows:3,maxRows:10}} />
+                      </div>
+                    ),
+                    onOk:()=>{
+                      const val = (document.getElementById('pt-edit-content') as HTMLTextAreaElement)?.value
+                      setPromptTemplates(prev=> ({...prev, [name]: val||''}))
+                    }
+                  })
+                }}>编辑</a>,
+                <a key='del' onClick={()=>{
+                  Modal.confirm({
+                    title:'删除模板', content:name, onOk:()=>{
+                      setPromptTemplates(prev=>{
+                        const cp = {...prev}; delete cp[name];
+                        if(promptActive===name) setPromptActive(undefined)
+                        return cp
+                      })
+                    }
+                  })
+                }}>删除</a>
+              ]}
+            >
+              <List.Item.Meta
+                title={name}
+                description={<pre style={{whiteSpace:'pre-wrap'}}>{content}</pre>}
+              />
+            </List.Item>
+          )}
+        />
+        <div style={{marginTop:8, opacity:0.7}}>说明：模板通过 /prompts 持久化到 prompts.json；选择“激活模板”后，问答将优先使用对应系统提示词。若未选择模板且“回答系统提示词”为空，则使用内置默认提示词。</div>
+      </div>
 
       <Collapse style={{marginTop:8}}>
         <Panel header={<span>高级（原始 JSON 只读概览）</span>} key="adv">
