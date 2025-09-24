@@ -38,7 +38,8 @@ CALL db.index.vector.createNodeIndex(
 
 UPSERT_CHUNK = """
 MERGE (c:Chunk {id: $id})
-SET c.text = $text, c.embedding = $embedding, c.source = $source, c.hash = $hash
+ON CREATE SET c.createdAt = timestamp()
+SET c.text = $text, c.embedding = $embedding, c.source = $source, c.hash = $hash, c.updatedAt = timestamp()
 """
 
 MERGE_ENTITY = """

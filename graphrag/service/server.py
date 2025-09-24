@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Body, Query as FQuery
 from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from ..schemas.api import IngestRequest, QueryRequest, QueryChunk, ChatMessage
 from ..graph_ingest.ingest import ingest_path
 import threading
@@ -13,6 +15,7 @@ from ..retriever.bm25 import bm25_index
 from ..retriever.rerank import rerank_post_score
 from ..utils.graph_rank import get_degree_scores
 from ..config.settings import get_settings
+from ..config.settings import Settings as SettingsModel
 from ..utils.diagnostics import run_all as run_diagnostics
 from ..retriever.retrieve import build_prompt
 from ..llm.client import extract_relations
@@ -21,9 +24,106 @@ settings = get_settings()
 
 app = FastAPI(title="Evolution RAG QA")
 
+# Mount a simple static UI (to be added under project root /ui)
+try:
+    import os
+    ui_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'ui')
+    if os.path.isdir(ui_dir):
+        app.mount("/ui", StaticFiles(directory=ui_dir, html=True), name="ui")
+except Exception:
+    pass
+
+# Enable CORS for frontend separation (default allow localhost dev; adjust in production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # for dev; tighten in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.get("/health")
 def health():
     return {"status": "ok", "api_version": settings.api_version}
+
+# ---- Config management endpoints ----
+@app.get("/config")
+def get_config():
+    try:
+        # 使用 pydantic v2 model_dump 导出当前配置，避免暴露敏感信息（不返回 neo4j_password）
+        data = settings.model_dump()
+        if "neo4j_password" in data:
+            data.pop("neo4j_password")
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _persist_env(updates: dict):
+    import os, re
+    # 仅持久化有 alias 的字段（环境变量名）
+    fields = SettingsModel.model_fields
+    key_map = {}
+    for fname, f in fields.items():
+        alias = getattr(f, 'alias', None)
+        if alias:
+            key_map[fname] = alias
+    # 目标 .env 路径
+    root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    env_path = os.path.join(root, '.env')
+    original = ''
+    if os.path.exists(env_path):
+        with open(env_path, 'r', encoding='utf-8', errors='ignore') as rf:
+            original = rf.read()
+    lines = original.splitlines() if original else []
+    idx_map = {}
+    for i, line in enumerate(lines):
+        m = re.match(r"\s*([A-Z0-9_]+)\s*=", line)
+        if m:
+            idx_map[m.group(1)] = i
+    def to_env_str(v):
+        if isinstance(v, bool):
+            return 'true' if v else 'false'
+        return str(v)
+    for fname, val in updates.items():
+        alias = key_map.get(fname)
+        if not alias:
+            continue
+        new_line = f"{alias}={to_env_str(val)}"
+        if alias in idx_map:
+            lines[idx_map[alias]] = new_line
+        else:
+            lines.append(new_line)
+    text = "\n".join(lines) + ("\n" if lines and not lines[-1].endswith('\n') else "")
+    with open(env_path, 'w', encoding='utf-8') as wf:
+        wf.write(text)
+    return {"env_path": env_path}
+
+
+@app.post("/config")
+def patch_config(payload: dict = Body(...), persist: bool = FQuery(False, description="是否把改动写入 .env")):
+    try:
+        # 仅允许已定义字段
+        allowed = set(SettingsModel.model_fields.keys())
+        patch = {k: v for k, v in (payload or {}).items() if k in allowed}
+        if not patch:
+            return {"updated": [], "persisted": False}
+        # 通过 pydantic 进行一次校验与类型规范
+        new_model = settings.model_copy(update=patch, deep=True)
+        # 就地更新（保持单例引用不变）
+        for k in patch.keys():
+            setattr(settings, k, getattr(new_model, k))
+        result = {"updated": list(patch.keys())}
+        if persist:
+            # 不持久化敏感字段时可按需过滤；这里允许持久化包括凭据在内的字段
+            info = _persist_env(patch)
+            result["persisted"] = True
+            result["env"] = info
+        else:
+            result["persisted"] = False
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/ingest")
 def ingest(
@@ -287,17 +387,47 @@ def query(req: QueryRequest):
         )
     except Exception as e:
         import traceback
-        return JSONResponse({
+        msg = str(e)
+        hint = None
+        # 针对 Neo4j 认证类错误提供明确修复建议
+        if "Neo.ClientError.Security.Unauthorized" in msg or "AuthenticationRateLimit" in msg:
+            hint = (
+                "Neo4j 鉴权失败/触发频率限制：请检查 .env 中 NEO4J_URI/NEO4J_USER/NEO4J_PASSWORD 是否正确，"
+                "并等待一会儿再重试（多次错误登录会触发临时封禁）。"
+            )
+        payload = {
             "error": "query_failed",
-            "message": str(e),
+            "message": msg,
             "trace": traceback.format_exc(limit=3)
-        }, status_code=500)
+        }
+        if hint:
+            payload["hint"] = hint
+        return JSONResponse(payload, status_code=500)
     # 将外部上下文与历史集成到提示词（仅在我们自行组装 messages 的非流式分支中可直接控制；
     # 流式分支按原逻辑维持最小变更，后续可扩展为显式 messages 管线）
+    # --- 简单问答日志写入工具（最佳努力，不影响主流程） ---
+    def _log_qa(question: str, answer: str | None, sources: list[dict] | None):
+        try:
+            with get_driver().session() as session:
+                # 写入/更新一个 QA_LOG 节点
+                session.run(
+                    """
+                    MERGE (q:QA_LOG {id: randomUUID()})
+                    SET q.question = $q, q.answer = coalesce($a, q.answer), q.updatedAt = timestamp(),
+                        q.createdAt = coalesce(q.createdAt, timestamp()), q.sourceIds = $s
+                    RETURN q.id AS id
+                    """,
+                    q=req.question, a=answer, s=[s.get('id') for s in (sources or [])]
+                )
+        except Exception:
+            pass
+
     if req.stream:
         def plain_stream():
             try:
+                collected = []
                 for chunk in answer_gen:
+                    collected.append(chunk)
                     yield chunk
             except Exception as ie:
                 yield f"\n[ERROR] {ie}\n"
@@ -306,6 +436,11 @@ def query(req: QueryRequest):
                     f"- {i}. {s['id']} (rank={s.get('rank')}, reason={s.get('reason')}, score={s.get('score')})" for i, s in enumerate(sources, 1)
                 )
                 yield refs
+            # best-effort log at end
+            try:
+                _log_qa(req.question, ''.join(collected), sources)
+            except Exception:
+                pass
         return StreamingResponse(plain_stream(), media_type="text/plain; charset=utf-8")
     else:
         text = ''.join(list(answer_gen))
@@ -368,6 +503,11 @@ def query(req: QueryRequest):
         payload = {"answer": text, "sources": sources, "references": references, "entities": entities_stat}
         if warnings:
             payload["warnings"] = warnings
+        # 异步写日志（不阻塞返回）
+        try:
+            _log_qa(req.question, text, sources)
+        except Exception:
+            pass
         return JSONResponse(payload)
 
 @app.get("/diagnostics")
@@ -485,5 +625,251 @@ def ranking_preview(req: QueryRequest):
                 } for c in contexts[: settings.top_k * 3]
             ]
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ------------------- 文档与配置管理 API -------------------
+@app.get('/docs/sources')
+def list_sources(limit: int = 50, skip: int = 0):
+    """列出已导入的文档来源（source 路径）及统计。"""
+    try:
+        with get_driver().session() as session:
+            rows = session.run(
+                """
+                MATCH (c:Chunk)
+                WITH c.source AS src, count(*) AS chunks, min(c.createdAt) AS createdAt, max(c.updatedAt) AS updatedAt
+                RETURN src AS source, chunks, createdAt, updatedAt
+                ORDER BY updatedAt DESC, source
+                SKIP $skip LIMIT $limit
+                """,
+                skip=skip,
+                limit=limit,
+            )
+            items = [
+                {
+                    'source': r['source'],
+                    'chunks': r['chunks'],
+                    'createdAt': r['createdAt'],
+                    'updatedAt': r['updatedAt']
+                } for r in rows
+            ]
+            # total
+            total_rec = session.run("MATCH (c:Chunk) RETURN count(DISTINCT c.source) AS total").single()
+            total = total_rec["total"] if total_rec else 0
+        return {'items': items, 'total': total}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get('/docs/chunks')
+def list_chunks(source: str, limit: int = 100, skip: int = 0, after: str | None = None):
+    """按来源列出部分 Chunk。支持 after 游标（id），用于分页。"""
+    try:
+        with get_driver().session() as session:
+            if after:
+                cy = """
+                MATCH (c:Chunk {source:$s}) WHERE c.id > $a
+                RETURN c.id AS id, c.text AS text, c.createdAt AS createdAt, c.updatedAt AS updatedAt
+                ORDER BY c.id ASC
+                SKIP $skip LIMIT $l
+                """
+                rows = session.run(cy, s=source, a=after, l=limit, skip=skip)
+            else:
+                cy = """
+                MATCH (c:Chunk {source:$s})
+                RETURN c.id AS id, c.text AS text, c.createdAt AS createdAt, c.updatedAt AS updatedAt
+                ORDER BY c.id ASC
+                SKIP $skip LIMIT $l
+                """
+                rows = session.run(cy, s=source, l=limit, skip=skip)
+            items = [{
+                'id': r['id'], 'preview': (r['text'] or '')[:160],
+                'createdAt': r.get('createdAt'), 'updatedAt': r.get('updatedAt')
+            } for r in rows]
+            # total
+            total_rec = session.run("MATCH (c:Chunk {source:$s}) RETURN count(*) AS total", s=source).single()
+            total = total_rec["total"] if total_rec else 0
+        return {'items': items, 'total': total}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete('/docs/source')
+def delete_source(source: str, erase_entities: bool = False):
+    """删除某个来源的所有 Chunk 以及相关的派生关系。
+    可选是否删除不再被引用的实体。"""
+    try:
+        with get_driver().session() as session:
+            session.run("""
+                MATCH (c:Chunk {source:$s})
+                DETACH DELETE c
+            """, s=source)
+            # 清理孤立实体
+            if erase_entities:
+                session.run("MATCH (e:Entity) WHERE NOT (e)<-[:HAS_ENTITY]-() DETACH DELETE e")
+        return {'deleted': True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get('/docs/search')
+def search_chunks(q: str, limit: int = 50):
+    """简单全文包含搜索 chunk（Neo4j CONTAINS）。"""
+    try:
+        with get_driver().session() as session:
+            rows = session.run(
+                """
+                MATCH (c:Chunk) WHERE toLower(c.text) CONTAINS toLower($q)
+                RETURN c.id AS id, c.text AS text, c.source AS source
+                LIMIT $l
+                """, q=q, l=limit
+            )
+            items = [{
+                'id': r['id'], 'source': r['source'], 'preview': (r['text'] or '')[:160]
+            } for r in rows]
+        return {'items': items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get('/docs/chunk')
+def get_chunk(id: str):
+    """获取单个 Chunk 的完整信息（文本、实体、简单关系计数）。"""
+    try:
+        with get_driver().session() as session:
+            rec = session.run(
+                """
+                MATCH (c:Chunk {id:$id})
+                OPTIONAL MATCH (c)-[:HAS_ENTITY]->(e:Entity)
+                WITH c, collect(e.name) AS ents
+                RETURN c.id AS id, c.text AS text, c.source AS source, c.createdAt AS createdAt, c.updatedAt AS updatedAt, ents AS entities
+                """, id=id
+            ).single()
+            if not rec:
+                raise HTTPException(status_code=404, detail="not_found")
+            # 关系统计
+            rel = session.run(
+                """
+                MATCH (c:Chunk {id:$id})-[r:RELATES_TO|REL]-(o:Chunk)
+                RETURN type(r) AS t, count(*) AS cnt
+                """, id=id
+            )
+            rel_stats = [{"type": r["t"], "count": r["cnt"]} for r in rel]
+            return {
+                "id": rec["id"],
+                "text": rec["text"],
+                "source": rec["source"],
+                "createdAt": rec.get("createdAt"),
+                "updatedAt": rec.get("updatedAt"),
+                "entities": rec.get("entities") or [],
+                "relations": rel_stats,
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get('/config')
+def get_config():
+    """读取当前配置（只读视图）。"""
+    try:
+        st = get_settings()
+        # 转为字典（含别名环境变量名的关键项做映射名展示）
+        data = st.model_dump()
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post('/config')
+def update_config(patch: dict):
+    """动态更新部分配置（进程内生效；重启后需 .env 保留）。仅覆盖提供字段。"""
+    try:
+        # get_settings 使用了 lru_cache，需要替换为新的实例
+        from ..config.settings import get_settings as gs, Settings, lru_cache
+        # 清除缓存
+        gs.cache_clear()  # type: ignore[attr-defined]
+        # 构造新 Settings，使用现有环境 + patch 覆盖
+        st = Settings(**{**gs().model_dump(), **patch})  # type: ignore
+        # 重新缓存
+        from functools import lru_cache as _lc
+        # 由于原函数带装饰器，简化处理：重新赋值全局 settings 用于本模块使用
+        global settings
+        settings = st
+        return {'updated': True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get('/qa/logs')
+def list_qa_logs(limit: int = 50, skip: int = 0):
+    try:
+        with get_driver().session() as session:
+            rows = session.run(
+                """
+                MATCH (q:QA_LOG)
+                RETURN q.id AS id, q.question AS question, q.answer AS answer, q.updatedAt AS updatedAt, q.sourceIds AS sourceIds
+                ORDER BY coalesce(q.updatedAt,q.createdAt) DESC
+                SKIP $skip LIMIT $l
+                """, l=limit, skip=skip
+            )
+            items = [{
+                'id': r['id'], 'question': r['question'], 'answer': r.get('answer'), 'answer_preview': (r.get('answer') or '')[:160],
+                'updatedAt': r.get('updatedAt'), 'sourceIds': r.get('sourceIds')
+            } for r in rows]
+            total_rec = session.run("MATCH (q:QA_LOG) RETURN count(*) AS total").single()
+            total = total_rec["total"] if total_rec else 0
+        return {'items': items, 'total': total}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get('/graph/egonet')
+def graph_egonet(id: str, depth: int = 1, limit: int = 120):
+    """返回以某个 Chunk 为中心的局部图谱（邻域）。
+
+    返回:
+      {
+        nodes: [{id,label,type}],
+        edges: [{source,target,type,confidence,weight}]
+      }
+    """
+    try:
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        with get_driver().session() as session:
+            # 中心节点
+            rec = session.run("MATCH (c:Chunk {id:$id}) RETURN c.id AS id, c.text AS text", id=id).single()
+            if not rec:
+                raise HTTPException(status_code=404, detail="chunk_not_found")
+            nodes.append({"id": rec["id"], "label": rec["id"], "type": "chunk"})
+            seen = {rec["id"]}
+            # 连接的实体
+            rows_ent = session.run(
+                """
+                MATCH (c:Chunk {id:$id})-[:HAS_ENTITY]->(e:Entity)
+                RETURN e.name AS name
+                LIMIT $lim
+                """, id=id, lim=limit
+            )
+            for r in rows_ent:
+                nm = r["name"]
+                if nm not in seen:
+                    nodes.append({"id": nm, "label": nm, "type": "entity"})
+                    seen.add(nm)
+                edges.append({"source": id, "target": nm, "type": "HAS_ENTITY"})
+            # 相邻的 Chunk (RELATES_TO / REL)
+            if depth >= 1:
+                rows_rel = session.run(
+                    """
+                    MATCH (c:Chunk {id:$id})-[r:RELATES_TO|REL]-(o:Chunk)
+                    RETURN o.id AS id, type(r) AS t, r.type AS rel_type, r.confidence AS conf, r.weight AS weight
+                    LIMIT $lim
+                    """, id=id, lim=limit
+                )
+                for r in rows_rel:
+                    oc = r["id"]
+                    if oc not in seen:
+                        nodes.append({"id": oc, "label": oc, "type": "chunk"})
+                        seen.add(oc)
+                    t = r["t"]
+                    tt = r.get("rel_type") if t == "REL" else t
+                    edges.append({"source": id, "target": oc, "type": tt or t, "confidence": r.get("conf"), "weight": r.get("weight")})
+        return {"nodes": nodes, "edges": edges}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

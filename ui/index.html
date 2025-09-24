@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Evolution GraphRAG 控制台</title>
+  <style>
+    body{font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,Apple Color Emoji,Segoe UI Emoji; margin:0;}
+    header{position:sticky;top:0;background:#111;color:#fff;padding:10px 16px;z-index:10;display:flex;gap:12px;align-items:center}
+    header h1{font-size:16px;margin:0;font-weight:600}
+    main{padding:16px;display:grid;grid-template-columns: 300px 1fr;gap:16px}
+    nav{border-right:1px solid #eee;padding-right:12px}
+    nav button{display:block;width:100%;padding:10px;margin:6px 0;border:1px solid #ddd;background:#fafafa;border-radius:8px;cursor:pointer;text-align:left}
+    section{display:none}
+    section.active{display:block}
+    .card{background:#fff;border:1px solid #eee;border-radius:10px;padding:12px;margin-bottom:12px}
+    .row{display:flex;gap:8px;align-items:center;margin:6px 0}
+    input,select,textarea{padding:8px;border:1px solid #ddd;border-radius:8px;width:100%}
+    textarea{min-height:100px}
+    .list{max-height:320px;overflow:auto;border:1px solid #eee;border-radius:8px;padding:8px}
+    .muted{color:#888}
+    .pill{display:inline-block;background:#eef;border:1px solid #dde;border-radius:999px;padding:2px 8px;margin-right:6px;font-size:12px}
+    .danger{background:#fee;border-color:#fcc}
+    .btn{padding:8px 10px;border-radius:8px;border:1px solid #ddd;background:#f6f6f6;cursor:pointer}
+    .btn.primary{background:#1f6feb;color:#fff;border-color:#1f6feb}
+    .sources li{margin:6px 0}
+    pre{white-space:pre-wrap;word-break:break-word;background:#fafafa;border:1px solid #eee;border-radius:8px;padding:8px}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Evolution GraphRAG 控制台</h1>
+    <span class="muted">/ui · 轻量前端</span>
+  </header>
+  <main>
+    <nav>
+      <button onclick="show('qa')">问答</button>
+      <button onclick="show('docs')">文档管理</button>
+      <button onclick="show('logs')">问答日志</button>
+      <button onclick="show('config')">配置</button>
+      <div class="card">
+        <div class="row">
+          <button class="btn" onclick="health()">API 健康检查</button>
+          <span id="health" class="muted"></span>
+        </div>
+      </div>
+    </nav>
+    <div>
+      <section id="qa" class="active">
+        <div class="card">
+          <h3>用户问答</h3>
+          <div class="row"><textarea id="question" placeholder="请输入你的问题..."></textarea></div>
+          <div class="row">
+            <label><input type="checkbox" id="stream"> 流式</label>
+            <button class="btn primary" onclick="ask()">提问</button>
+          </div>
+          <div class="row">
+            <div style="flex:1">
+              <h4>回答</h4>
+              <pre id="answer"></pre>
+            </div>
+            <div style="width:320px">
+              <h4>引用</h4>
+              <div id="sources" class="list"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="docs">
+        <div class="card">
+          <h3>文档来源</h3>
+          <div class="row">
+            <input id="ingestPath" placeholder="文件或目录绝对路径" />
+            <label title="新增文件/Chunk"><input type="checkbox" id="inc"> incremental</label>
+            <label title="刷新实体与关系"><input type="checkbox" id="refresh"> refresh</label>
+            <label title="刷新时是否跑关系"><input type="checkbox" id="refresh_rel" checked> refresh_rel</label>
+            <button class="btn primary" onclick="ingest()">开始导入</button>
+          </div>
+          <div class="row">
+            <button class="btn" onclick="loadSources()">刷新来源列表</button>
+          </div>
+          <ul id="sourcesList" class="sources"></ul>
+        </div>
+      </section>
+
+      <section id="logs">
+        <div class="card">
+          <h3>问答日志</h3>
+          <div class="row">
+            <button class="btn" onclick="loadLogs()">刷新</button>
+          </div>
+          <div id="logsList" class="list"></div>
+        </div>
+      </section>
+
+      <section id="config">
+        <div class="card">
+          <h3>配置查看与快速修改</h3>
+          <div class="row">
+            <button class="btn" onclick="loadConfig()">读取配置</button>
+            <button class="btn primary" onclick="saveConfig()">保存更改</button>
+          </div>
+          <textarea id="configText" placeholder="配置 JSON"></textarea>
+        </div>
+      </section>
+    </div>
+  </main>
+
+<script>
+function show(id){
+  for(const s of document.querySelectorAll('section')) s.classList.remove('active');
+  document.getElementById(id).classList.add('active');
+}
+async function health(){
+  const r = await fetch('/health');
+  const j = await r.json();
+  document.getElementById('health').textContent = j.status + ' v'+j.api_version;
+}
+async function ask(){
+  const q = document.getElementById('question').value.trim();
+  if(!q) return;
+  const stream = document.getElementById('stream').checked;
+  const ans = document.getElementById('answer');
+  const srcs = document.getElementById('sources');
+  ans.textContent = ''; srcs.innerHTML='';
+  if(stream){
+    const resp = await fetch('/query', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({question:q, stream:true})});
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    while(true){
+      const {value, done} = await reader.read();
+      if(done) break;
+      ans.textContent += dec.decode(value);
+    }
+  }else{
+    const r = await fetch('/query', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({question:q, stream:false})});
+    const j = await r.json();
+    ans.textContent = j.answer || JSON.stringify(j,null,2);
+    if(j.sources){
+      srcs.innerHTML = j.sources.map((s,i)=>`<div class='pill'>S${s.rank||i+1}</div> <code>${s.id}</code> <span class='muted'>${(s.preview||'').replace(/</g,'&lt;')}</span>`).join('<hr>');
+    }
+  }
+}
+async function ingest(){
+  const path = document.getElementById('ingestPath').value.trim();
+  if(!path) return alert('请输入路径');
+  const inc = document.getElementById('inc').checked;
+  const refresh = document.getElementById('refresh').checked;
+  const refresh_rel = document.getElementById('refresh_rel').checked;
+  const u = new URL('/ingest/stream', location.origin);
+  u.searchParams.set('path', path);
+  u.searchParams.set('incremental', inc);
+  u.searchParams.set('refresh', refresh);
+  u.searchParams.set('refresh_relations', refresh_rel);
+  const es = new EventSource(u.toString());
+  es.onmessage = (e)=>{
+    try{
+      const data = JSON.parse(e.data);
+      console.log('ingest', data);
+    }catch{ console.log('msg', e.data); }
+  };
+  es.addEventListener('result', (e)=>{
+    try{ const data = JSON.parse(e.data); alert('完成: '+JSON.stringify(data.result)); }catch{}
+  });
+}
+async function loadSources(){
+  const r = await fetch('/docs/sources');
+  const j = await r.json();
+  const ul = document.getElementById('sourcesList');
+  ul.innerHTML = (j.items||[]).map(it=>`<li><code>${it.source}</code> · ${it.chunks} chunks <button class='btn danger' onclick="delSource('${it.source.replace(/'/g,"\'")}')">删除</button></li>`).join('');
+}
+async function delSource(src){
+  if(!confirm('确认删除来源及其所有 Chunk? '+src)) return;
+  const u = new URL('/docs/source', location.origin);
+  u.searchParams.set('source', src);
+  const r = await fetch(u.toString(), {method:'DELETE'});
+  if(r.ok){ loadSources(); }
+}
+async function loadLogs(){
+  const r = await fetch('/qa/logs');
+  const j = await r.json();
+  const el = document.getElementById('logsList');
+  el.innerHTML = (j.items||[]).map(it=>`<div class='card'><div class='muted'>${new Date(it.updatedAt||Date.now()).toLocaleString()}</div><div><strong>Q:</strong> ${it.question||''}</div><div><strong>A:</strong> ${(it.answer_preview||'').replace(/</g,'&lt;')}</div></div>`).join('');
+}
+async function loadConfig(){
+  const r = await fetch('/config');
+  const j = await r.json();
+  document.getElementById('configText').value = JSON.stringify(j, null, 2);
+}
+async function saveConfig(){
+  let patch;
+  try{ patch = JSON.parse(document.getElementById('configText').value); }catch{ return alert('JSON 解析失败'); }
+  const r = await fetch('/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(patch)});
+  if(r.ok){ alert('已更新（进程内生效）'); } else { alert('更新失败'); }
+}
+// 初始加载
+health(); loadSources(); loadLogs();
+</script>
+</body>
+</html>
