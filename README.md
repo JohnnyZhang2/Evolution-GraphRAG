@@ -33,10 +33,8 @@ flowchart TD
     B --> C[向量化 Embedding]
     C --> D[写入 Chunk 节点]
     D --> E{实体抽取?}
-  %% GitHub Mermaid 有时对非 ASCII edge label 存在解析问题，移除中文标签以提升兼容性
-  %% 原: E -->|否| G / E -->|是| F
-  E --> G[关系构建(跳过实体关系)]
-  E --> F[LLM 实体抽取 -> Entity/HAS_ENTITY]
+    E --> G[关系构建(跳过实体关系)]
+    E --> F[LLM 实体抽取 -> Entity/HAS_ENTITY]
     F --> G[构建 RELATES_TO / CO_OCCURS_WITH]
     G --> H[Pairwise LLM 语义关系 :REL]
     H --> I[完成 / 可增量或刷新]
@@ -45,10 +43,9 @@ flowchart TD
   subgraph Query
     Q1[用户问题] --> Q2[向量化(缓存)] --> Q3[向量检索 TOP_K]
     Q1H((会话历史/外部上下文)) --> Q9
-  Q3 --> Q4{EXPAND_HOPS=2?}
-  %% 移除条件边标签避免 GitHub Mermaid 解析歧义
-  Q4 --> Q6[合并候选]
-  Q4 --> Q5[子图扩展: 实体/关系/共现<br/>(配额/预留/深度衰减)]
+    Q3 --> Q4{EXPAND_HOPS=2?}
+    Q4 --> Q6[合并候选]
+    Q4 --> Q5[子图扩展: 实体/关系/共现<br/>(配额/预留/深度衰减)]
     Q5 --> Q6[合并候选]
     Q6 --> Q7[Hybrid + Path Scoring<br/>(+BM25/+中心性)]
     Q7 --> Q8[TopN (+Rerank?)]
