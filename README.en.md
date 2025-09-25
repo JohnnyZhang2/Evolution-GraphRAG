@@ -36,15 +36,47 @@ Docs -> split -> embed(hash skip) -> entities(normalize) -> RELATES_TO / CO_OCCU
 Query -> synonym normalize -> embed(cache) -> vector retrieve -> (expand) -> hybrid score -> answer + references
 ```
 
-Mermaid / full data model & flow diagrams are in the feature guide.
+Mermaid / full data model & flow diagrams are in the feature guide. Core ingest/query flow (labels simplified for GitHub Mermaid compatibility):
+
+```mermaid
+flowchart TD
+  subgraph Ingest
+    A[Read Files] --> B[Split Chunks]
+    B --> C[Embedding]
+    C --> D[Write Chunk Nodes]
+    D --> E{Entity Extract?}
+    E --> G[Relation Build (skip entity graph)]
+    E --> F[LLM Entities -> Entity/HAS_ENTITY]
+    F --> G[RELATES_TO / CO_OCCURS_WITH]
+    G --> H[Pairwise LLM Semantic :REL]
+    H --> I[Done / Incremental or Refresh]
+  end
+
+  subgraph Query
+    Q1[User Question] --> Q2[Embed (cache)] --> Q3[Vector TOP_K]
+    Q1H((History / External)) --> Q9
+    Q3 --> Q4{EXPAND_HOPS=2?}
+    Q4 --> Q6[Merge Candidates]
+    Q4 --> Q5[Subgraph Expansion<br/>(entities/relations/co-occur)]
+    Q5 --> Q6[Merge]
+    Q6 --> Q7[Hybrid + Path Scoring<br/>(+BM25/+Centrality)]
+    Q7 --> Q8[TopN (+Rerank?)]
+    Q8 --> Q9[Context Assembly]
+    Q9 --> Q10[LLM Answer]
+    Q10 --> Q11[Citation Postproc]
+    Q11 --> Q12[Return JSON / Stream]
+  end
+
+  I --> Q3
+```
 
 ## 🚀 Quick Start
 
 Clone & enter directory:
 
 ```bash
-git clone https://github.com/your-org/evolution-rag.git
-cd evolution-rag
+git clone https://github.com/JohnnyZhang2/Evolution-GraphRAG.git
+cd Evolution-GraphRAG
 ```
 
 ```bash

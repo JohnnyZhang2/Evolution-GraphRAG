@@ -57,8 +57,9 @@ flowchart TD
     B --> C[Embedding]
     C --> D[Write Chunk Nodes]
   D --> E{Entity Extract?}
-  E -->|No| G[Relation Build (skip entity graph)]
-  E -->|Yes| F[LLM Entities -> Entity/HAS_ENTITY]
+  %% Simplified edges (removed Yes/No labels for GitHub Mermaid compatibility)
+  E --> G[Relation Build (skip entity graph)]
+  E --> F[LLM Entities -> Entity/HAS_ENTITY]
     F --> G[RELATES_TO / CO_OCCURS_WITH]
     G --> H[Pairwise LLM Semantic :REL]
     H --> I[Done / Incremental or Refresh]
@@ -68,8 +69,9 @@ flowchart TD
     Q1[User Question] --> Q2[Embed (cache)] --> Q3[Vector TOP_K]
     Q1H((History / External)) --> Q9
     Q3 --> Q4{EXPAND_HOPS=2?}
-    Q4 -- No --> Q6[Merge Candidates]
-  Q4 -- Yes --> Q5[Subgraph Expansion: Entities/Relations/Co-occur<br/>(quotas/reserve/depth decay)]
+    %% Removed conditional edge labels
+    Q4 --> Q6[Merge Candidates]
+    Q4 --> Q5[Subgraph Expansion: Entities/Relations/Co-occur<br/>(quotas/reserve/depth decay)]
     Q5 --> Q6[Merge]
   Q6 --> Q7[Hybrid + Path Scoring<br/>(+BM25/+Centrality)]
     Q7 --> Q8[TopN (+Rerank?)]
