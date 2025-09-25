@@ -8,13 +8,31 @@ See also: [Chinese API Docs](docs/API.zh-CN.md) | [English API Docs](docs/API.en
 
 ## [Unreleased]
 
-### Added (release)
+### Added (since 0.1.0)
 
-- (placeholder) Add new items here when preparing next release.
+- Frontend React admin (Docs viewer + Local graph egonet + QA chat with streaming, citations, markdown, syntax highlight, retry/copy, conversation titles).
+- Prompt templates store (`prompts.json`) with REST endpoints `/prompts` (GET/POST) supporting active template + multiple variants.
+- Configurable system prompt & multi-template priority resolution (prompts.json > active template in settings > single answer_system_prompt > built-in default).
+- Subgraph path-level scoring (`SUBGRAPH_PATH_SCORE_ENABLE` & related weights) integrated into hybrid ranking bonus.
+- External context & conversation history injection into `/query` (context items appear as cite-able sources).
 
-### Changed (release)
+### Changed (since 0.1.0)
 
-- (placeholder)
+- `build_prompt` now prefers prompts.json active template before settings fields.
+- README updated to reflect default port 8010 and frontend startup, rerank status wording, and prompt management.
+
+### Fixed (since 0.1.0)
+
+- Cytoscape local graph not rendering when modal initially hidden (force resize/layout on visibility change).
+- Streaming chat occasional stall by introducing requestAnimationFrame throttling and typewriter buffer logic.
+
+### Deprecated (since 0.1.0)
+
+- Environment variable based multi-template storage (`ANSWER_PROMPT_TEMPLATES` / `ANSWER_PROMPT_ACTIVE`) planned for removal in a future major once all users migrate to prompts.json.
+
+### Security (since 0.1.0)
+
+- CORS liberal dev default (note: production hardening guidance to be added).
 
 ### Deprecated
 

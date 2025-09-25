@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     # ---- API Version ----
     # Bump this when breaking API response contracts or adding notable features
-    api_version: str = Field("0.1.0", alias="API_VERSION")
+    api_version: str = Field("0.2.0", alias="API_VERSION")
 
     llm_base_url: str = Field("http://192.168.31.172:1234", alias="LLM_BASE_URL")
     llm_api_key: str = Field("dummy", alias="LLM_API_KEY")  # LM Studio 通常不校验，可以给默认

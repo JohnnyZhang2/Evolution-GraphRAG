@@ -70,13 +70,13 @@ cd evolution-rag
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn graphrag.service.server:app --reload --port 8000
+uvicorn graphrag.service.server:app --reload --port 8010
 ```
 
 导入文档：
 
 ```bash
-curl -X POST 'http://localhost:8000/ingest?incremental=false' \
+curl -X POST 'http://localhost:8010/ingest?incremental=false' \
   -H 'Content-Type: application/json' \
   -d '{"path":"./docs"}'
 ```
@@ -84,7 +84,7 @@ curl -X POST 'http://localhost:8000/ingest?incremental=false' \
 提问：
 
 ```bash
-curl -X POST http://localhost:8000/query \
+curl -X POST http://localhost:8010/query \
   -H 'Content-Type: application/json' \
   -d '{"question":"介绍系统架构"}'
 ```
@@ -92,7 +92,7 @@ curl -X POST http://localhost:8000/query \
 带外部上下文与会话历史：
 
 ```bash
-curl -X POST http://localhost:8000/query \
+curl -X POST http://localhost:8010/query \
   -H 'Content-Type: application/json' \
   -d '{
     "question":"介绍系统架构（结合下面额外背景）",
@@ -140,11 +140,12 @@ cp .env.example .env
 ```bash
 cp .env.example .env
 sed -i '' 's/CHANGE_ME/test123/g' .env    # macOS；Windows 手动编辑
-uvicorn graphrag.service.server:app --reload --port 8000 &
-curl -X POST 'http://localhost:8000/ingest?incremental=false' \
+uvicorn graphrag.service.server:app --reload --port 8010 &
+cd frontend && npm install && npm run dev & cd ..
+curl -X POST 'http://localhost:8010/ingest?incremental=false' \
   -H 'Content-Type: application/json' \
   -d '{"path":"./docs"}'
-curl -X POST http://localhost:8000/query \
+curl -X POST http://localhost:8010/query \
   -H 'Content-Type: application/json' \
   -d '{"question":"系统支持哪些关系类型"}'
 ```
@@ -171,7 +172,7 @@ curl -X POST http://localhost:8000/query \
 | 实体标准化 | `ENTITY_NORMALIZE_ENABLED` | 已实现 | ingest + query 同义替换 |
 | 噪声控制 | `ENTITY_MIN_LENGTH` / `COOCCUR_MIN_COUNT` | 已实现 | 过滤短实体 & 剪枝共现 |
 | 实体类型 & 关系白名单 | `ENTITY_TYPED_MODE` / `ENTITY_TYPES` / `RELATION_ENFORCE_TYPES` / `RELATION_TYPES` / `RELATION_FALLBACK_TYPE` | 已实现 | 限制实体/关系类型，写入 `Entity.type` |
-| Rerank 占位 | `RERANK_ENABLED` | 占位 | 暂未改变排序 |
+| Rerank | `RERANK_ENABLED` | 初步 | 若配置 rerank_endpoint 则融合 rerank 分数 |
 
 更多变量见 `.env` 与特性文档。下方新增“实体/关系类型自定义”说明。
 
@@ -261,7 +262,7 @@ RELATION_FALLBACK_TYPE=REFERENCES
 
 ## 🔖 版本管理与发版
 
-当前 API 版本在 `graphrag/config/settings.py` 中的 `api_version` 字段，并通过 `/health` 与 `/diagnostics` 暴露。
+当前 API 版本在 `graphrag/config/settings.py` 中的 `api_version` 字段，并通过 `/health` 与 `/diagnostics` 暴露。前端管理界面（React + Ant Design）提供：文档查看/局部图谱、问答聊天（流式 + 引用高亮）、配置与提示词模板管理（`/prompts`）。
 
 使用辅助脚本统一修改版本与变更日志：
 
