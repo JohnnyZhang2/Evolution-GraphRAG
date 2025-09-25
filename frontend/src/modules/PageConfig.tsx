@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Button, Checkbox, Space, message, Form, Input, InputNumber, Switch, Collapse, Divider, Tooltip, Typography, Select, List, Modal } from 'antd'
+import { Button, Checkbox, Space, message, Form, Input, InputNumber, Switch, Collapse, Divider, Tooltip, Typography, Select, List, Modal, Tag } from 'antd'
 import { InfoCircleOutlined } from '@ant-design/icons'
 const { Panel } = Collapse
 const { Text } = Typography
@@ -458,8 +458,8 @@ export function PageConfig(){
               ]}
             >
               <List.Item.Meta
-                title={name}
-                description={<pre style={{whiteSpace:'pre-wrap'}}>{content}</pre>}
+                title={<span>{name}{promptActive===name && <Tag color="green" style={{marginLeft:8}}>ACTIVE</Tag>}</span>}
+                description={<pre style={{whiteSpace:'pre-wrap', margin:0}}>{content}</pre>}
               />
             </List.Item>
           )}

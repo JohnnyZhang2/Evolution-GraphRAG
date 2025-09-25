@@ -10,7 +10,6 @@
 - [数据模型](#数据模型)
 - [Ingest 处理链](#ingest-处理链)
 - [Ingest 模式](#ingest-模式)
-- [检索流程](#检索流程)
 - [实时导入与恢复机制](#实时导入与恢复机制)
 - [检索流程](#检索流程)
 - [排序与权重策略](#排序与权重策略)
@@ -54,8 +53,9 @@ flowchart TD
     B --> C[向量化 Embedding]
     C --> D[写入 Chunk 节点]
     D --> E{实体抽取?}
-    E -- 否 --> G[关系构建(跳过实体关系)]
-    E -- 是 --> F[LLM 实体抽取 -> Entity/HAS_ENTITY]
+    %% 条件分支需使用 |标签| 语法，否则 GitHub Mermaid 解析失败
+    E -->|否| G[关系构建(跳过实体关系)]
+    E -->|是| F[LLM 实体抽取 -> Entity/HAS_ENTITY]
     F --> G[构建 RELATES_TO / CO_OCCURS_WITH]
     G --> H[Pairwise LLM 语义关系 :REL]
     H --> I[完成 / 可增量或刷新]
@@ -66,9 +66,9 @@ flowchart TD
     Q1H((会话历史/外部上下文)) --> Q9
     Q3 --> Q4{EXPAND_HOPS=2?}
     Q4 -- 否 --> Q6[合并候选]
-    Q4 -- 是 --> Q5[子图扩展: 实体/关系/共现\n(配额/预留/深度衰减)]
+  Q4 -- 是 --> Q5[子图扩展: 实体/关系/共现<br/>(配额/预留/深度衰减)]
     Q5 --> Q6[合并候选]
-    Q6 --> Q7[Hybrid + Path Scoring\n(+BM25/+中心性)]
+  Q6 --> Q7[Hybrid + Path Scoring<br/>(+BM25/+中心性)]
     Q7 --> Q8[TopN (+Rerank?)]
     Q8 --> Q9[上下文拼接(含外部 S#)]
     Q9 --> Q10[LLM 回答]
@@ -223,15 +223,25 @@ Ingest 内部对关键阶段调用 `record()`：
 ## 检索流程
 
 0.（可选）读取会话历史与外部上下文：历史仅影响提示词语境；外部上下文将参与 sources 并可被 [S#] 引用。
+
 1. 规范化查询（同义词替换，若开启实体标准化）
+
 2. 嵌入 & 缓存命中检测
+
 3. 向量初检 TOP_K（可并行准备 BM25 稀疏候选与图中心性特征）
+
 4. 可选扩展 (EXPAND_HOPS=2)：通过实体、`RELATES_TO`、`CO_OCCURS_WITH`、`:REL` 邻接扩展候选集合；受一跳/关系一跳配额与深层预留约束。
+
 5. 计算 hybrid 基础分：向量归一 + （可选 BM25）+ （可选 GraphRank）
+
 6. 路径级评分（若启用）：按实体/关系路径与深度衰减汇总 `path_score`，并以 `SUBGRAPH_PATH_SCORE_WEIGHT` 融入最终得分。
+
 7. 占位 rerank（若启用，当前不改变顺序，仅计分）
+
 8. 裁剪与配额：`CONTEXT_MAX`、`CONTEXT_MIN_PER_REASON`、`CONTEXT_PRUNE_*` 控制上下文规模与来源均衡。
+
 9. 截断 TopN -> 合并外部上下文 -> 组装含 [S#] 标签上下文 -> 发送回答
+
 10. 回答后处理（引用解析 / 未用来源 / 未引用数字）
 
 ## 排序与权重策略

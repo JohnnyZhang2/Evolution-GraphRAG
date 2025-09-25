@@ -56,9 +56,9 @@ flowchart TD
     A[Read Files] --> B[Split Chunks]
     B --> C[Embedding]
     C --> D[Write Chunk Nodes]
-    D --> E{Entity Extract?}
-    E -- No --> G[Relation Build (skip entity graph)]
-    E -- Yes --> F[LLM Entities -> Entity/HAS_ENTITY]
+  D --> E{Entity Extract?}
+  E -->|No| G[Relation Build (skip entity graph)]
+  E -->|Yes| F[LLM Entities -> Entity/HAS_ENTITY]
     F --> G[RELATES_TO / CO_OCCURS_WITH]
     G --> H[Pairwise LLM Semantic :REL]
     H --> I[Done / Incremental or Refresh]
@@ -69,9 +69,9 @@ flowchart TD
     Q1H((History / External)) --> Q9
     Q3 --> Q4{EXPAND_HOPS=2?}
     Q4 -- No --> Q6[Merge Candidates]
-    Q4 -- Yes --> Q5[Subgraph Expansion: Entities/Relations/Co-occur\\n(quotas/reserve/depth decay)]
+  Q4 -- Yes --> Q5[Subgraph Expansion: Entities/Relations/Co-occur<br/>(quotas/reserve/depth decay)]
     Q5 --> Q6[Merge]
-    Q6 --> Q7[Hybrid + Path Scoring\\n(+BM25/+Centrality)]
+  Q6 --> Q7[Hybrid + Path Scoring<br/>(+BM25/+Centrality)]
     Q7 --> Q8[TopN (+Rerank?)]
     Q8 --> Q9[Context Assembly (with external S#)]
     Q9 --> Q10[LLM Answer]
@@ -409,6 +409,51 @@ Note: when external contexts (`/query.context`) are provided, they appear in `so
 - `history`: ordered `{role,content}` messages appended to the prompt; does not directly change retrieval scoring.
 
 See `docs/API.en.md` for examples.
+
+## Prompt Template Management
+
+The system prompt for answer generation now supports multiple named templates with a clear precedence chain, enabling rapid style / verbosity / rigor switching without service restarts.
+
+Precedence (highest first):
+
+1. Active template stored in `prompts.json` (field `active`).
+2. Legacy environment multi-template fields `ANSWER_PROMPT_TEMPLATES` + `ANSWER_PROMPT_ACTIVE` (deprecated).
+3. Single legacy `ANSWER_SYSTEM_PROMPT` variable.
+4. Built-in default system prompt (enforces cite-only-from-sources, `[S#]` markers, no fabrication, respond in user language).
+
+Frontend (Config page) capabilities:
+
+- Create / edit / delete templates
+- Set the active template
+- Persist to `prompts.json` independently of other config
+- One-click import from legacy env format (overwrites templates with same name)
+
+Backend API:
+
+```jsonc
+GET /prompts  => {"active":"name"|null, "templates":[{"name","content"}, ...]}
+POST /prompts => same payload to persist
+```
+
+Recommendations:
+
+- Explicitly instruct: cite only relevant spans, admit when answer not derivable, keep user language.
+- Avoid excessive stylistic fluff that dilutes citation accuracy priorities.
+- Maintain specialized variants (e.g. concise summary vs detailed analysis) for quick toggling.
+
+Debug Tips:
+
+- Create a temporary template that outputs only the source id list to verify ordering / citation alignment, then switch back.
+- No restart required; next `/query` reflects changes.
+
+Migration Steps:
+
+1. If previously using env multi-templates, click “Import from .env” in the frontend.
+2. Verify the intended active template.
+3. Remove obsolete templates and rely solely on `prompts.json` going forward.
+4. Plan removal of the env-based mechanism in a future major version.
+
+Planned deprecation: environment multi-template variables will be removed after a grace period once most users migrate.
 
 ## Debugging & Depth Observability (optional)
 

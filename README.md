@@ -33,8 +33,8 @@ flowchart TD
     B --> C[向量化 Embedding]
     C --> D[写入 Chunk 节点]
     D --> E{实体抽取?}
-    E -- 否 --> G[关系构建(跳过实体关系)]
-    E -- 是 --> F[LLM 实体抽取 -> Entity/HAS_ENTITY]
+    E -->|否| G[关系构建(跳过实体关系)]
+    E -->|是| F[LLM 实体抽取 -> Entity/HAS_ENTITY]
     F --> G[构建 RELATES_TO / CO_OCCURS_WITH]
     G --> H[Pairwise LLM 语义关系 :REL]
     H --> I[完成 / 可增量或刷新]
@@ -45,9 +45,9 @@ flowchart TD
     Q1H((会话历史/外部上下文)) --> Q9
     Q3 --> Q4{EXPAND_HOPS=2?}
     Q4 -- 否 --> Q6[合并候选]
-    Q4 -- 是 --> Q5[子图扩展: 实体/关系/共现\n(配额/预留/深度衰减)]
+    Q4 -- 是 --> Q5[子图扩展: 实体/关系/共现<br/>(配额/预留/深度衰减)]
     Q5 --> Q6[合并候选]
-    Q6 --> Q7[Hybrid + Path Scoring\n(+BM25/+中心性)]
+    Q6 --> Q7[Hybrid + Path Scoring<br/>(+BM25/+中心性)]
     Q7 --> Q8[TopN (+Rerank?)]
     Q8 --> Q9[上下文拼接(含外部 S#)]
     Q9 --> Q10[LLM 回答]
@@ -63,8 +63,8 @@ flowchart TD
 克隆与进入目录：
 
 ```bash
-git clone https://github.com/your-org/evolution-rag.git
-cd evolution-rag
+git clone https://github.com/JohnnyZhang2/Evolution-GraphRAG.git
+cd Evolution-GraphRAG
 ```
 
 ```bash

@@ -38,7 +38,7 @@ OPTIONAL_PACKAGES = {
 
 # Mapping requirement name -> import module names to try
 IMPORT_NAME_OVERRIDES: Dict[str, List[str]] = {
-    'pypdf2': ['PyPDF2'],
+    'pypdf': ['pypdf', 'PyPDF2'],  # allow fallback if old package still installed
     'python-docx': ['docx'],
     'openpyxl': ['openpyxl'],
     'neo4j': ['neo4j'],

@@ -10,7 +10,7 @@ numpy
 scikit-learn
 python-docx
 openpyxl
-PyPDF2
+pypdf
 tiktoken
 orjson
 pytest

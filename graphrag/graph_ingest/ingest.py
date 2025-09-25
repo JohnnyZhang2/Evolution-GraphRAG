@@ -113,8 +113,12 @@ def read_file_content(path: str) -> str:
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             return f.read()
     elif ext == '.pdf':
-        from PyPDF2 import PdfReader
-        reader = PdfReader(path)
+        # Prefer the actively maintained 'pypdf' package; fall back to PyPDF2 if still present.
+        try:  # pragma: no cover - import path branch
+            from pypdf import PdfReader as _PdfReader  # type: ignore
+        except ImportError:  # pragma: no cover
+            from PyPDF2 import PdfReader as _PdfReader  # type: ignore
+        reader = _PdfReader(path)
         texts = []
         for page in reader.pages:
             try:

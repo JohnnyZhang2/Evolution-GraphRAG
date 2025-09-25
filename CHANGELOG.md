@@ -8,51 +8,51 @@ See also: [Chinese API Docs](docs/API.zh-CN.md) | [English API Docs](docs/API.en
 
 ## [Unreleased]
 
-### Added (since 0.1.0)
+### Added (Unreleased)
 
-- Frontend React admin (Docs viewer + Local graph egonet + QA chat with streaming, citations, markdown, syntax highlight, retry/copy, conversation titles).
-- Prompt templates store (`prompts.json`) with REST endpoints `/prompts` (GET/POST) supporting active template + multiple variants.
-- Configurable system prompt & multi-template priority resolution (prompts.json > active template in settings > single answer_system_prompt > built-in default).
-- Subgraph path-level scoring (`SUBGRAPH_PATH_SCORE_ENABLE` & related weights) integrated into hybrid ranking bonus.
-- External context & conversation history injection into `/query` (context items appear as cite-able sources).
+### Changed (Unreleased)
 
-### Changed (since 0.1.0)
+- Migrate PDF parsing dependency from deprecated PyPDF2 to actively maintained pypdf (ingest supports fallback import for compatibility).
 
-- `build_prompt` now prefers prompts.json active template before settings fields.
-- README updated to reflect default port 8010 and frontend startup, rerank status wording, and prompt management.
+### Fixed (Unreleased)
 
-### Fixed (since 0.1.0)
+### Deprecated (Unreleased)
 
-- Cytoscape local graph not rendering when modal initially hidden (force resize/layout on visibility change).
-- Streaming chat occasional stall by introducing requestAnimationFrame throttling and typewriter buffer logic.
+### Removed (Unreleased)
 
-### Deprecated (since 0.1.0)
+### Security (Unreleased)
 
-- Environment variable based multi-template storage (`ANSWER_PROMPT_TEMPLATES` / `ANSWER_PROMPT_ACTIVE`) planned for removal in a future major once all users migrate to prompts.json.
+## [0.2.0] - 2025-09-25
 
-### Security (since 0.1.0)
+### Added (0.2.0)
 
-- CORS liberal dev default (note: production hardening guidance to be added).
+- Frontend React admin (Docs viewer, local egonet graph, QA chat with streaming + citations + markdown + syntax highlight + retry/copy + conversation titles).
+- Prompt template store (`prompts.json`) with `/prompts` (GET/POST) for active + multiple templates.
+- Multi-template priority resolution (prompts.json > settings active > single system prompt > built-in default).
+- Subgraph path-level scoring (`SUBGRAPH_PATH_SCORE_ENABLE` & weights) integrated into hybrid ranking.
+- External context & conversation history in `/query` (external context becomes cite-able sources).
 
-### Deprecated
+### Changed (0.2.0)
 
-- (placeholder)
+- `build_prompt` selects prompts.json active template before legacy settings fields.
+- README updates: default port 8010, frontend startup instructions, rerank placeholder clarification, prompt management highlight, path-level scoring highlight.
 
-### Removed
+### Fixed (0.2.0)
 
-- (placeholder)
+- Cytoscape graph not rendering on initially hidden modal (trigger resize/layout on visibility).
+- Occasional streaming stalls mitigated via rAF throttling + typewriter buffering.
 
-### Fixed (release)
+### Deprecated (0.2.0)
 
-- (placeholder)
+- Env-based multi-template variables (`ANSWER_PROMPT_TEMPLATES`, `ANSWER_PROMPT_ACTIVE`) slated for removal after migration period.
 
-### Security
+### Security (0.2.0)
 
-- (placeholder)
+- Current CORS configuration permissive for dev; production hardening guidance pending.
 
 ## [0.1.0] - 2025-09-21
 
-### Added
+### Added (0.1.0)
 
 - Initial public API version exposure (`api_version` in `/health` & `/diagnostics`).
 - English API reference `docs/API.en.md` and Chinese API reference `docs/API.zh-CN.md` (version notes updated).
@@ -63,11 +63,11 @@ See also: [Chinese API Docs](docs/API.zh-CN.md) | [English API Docs](docs/API.en
 - Noise control: minimum entity length & co-occurrence edge pruning threshold.
 - Project-wide rebranding to “Evolution RAG” with unified copyright headers (MIT license).
 
-### Changed
+### Changed (0.1.0)
 
 - README split into bilingual documentation sets; branding & license notices updated.
 
-### Fixed
+### Fixed (0.1.0)
 
 - Markdown formatting issues (headings, fenced code blocks, list spacing) in documentation.
 - Encoding repair heuristic for Latin-1 garbled characters in non-stream query responses.
@@ -77,5 +77,6 @@ See also: [Chinese API Docs](docs/API.zh-CN.md) | [English API Docs](docs/API.en
 - Rerank logic currently a placeholder integration point.
 - Graph centrality (degree) bonus optional; future PageRank planned.
 
-[Unreleased]: https://example.com/compare/0.1.0...HEAD
+[Unreleased]: https://example.com/compare/0.2.0...HEAD
+[0.2.0]: https://example.com/releases/0.2.0
 [0.1.0]: https://example.com/releases/0.1.0
